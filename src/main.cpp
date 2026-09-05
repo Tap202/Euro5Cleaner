@@ -45,7 +45,9 @@ const unsigned long MULTI_FRAME_TIMEOUT_MS = 250;
 // LIVE TELEMETRY VARIABLES
 // ==========================================
 bool liveTelemetryMode = false;
-unsigned long lastTelemetryTime = 0;
+volatile bool requestTelemetryToggleAlert = false; // Flag for non-blocking callback
+bool telemetryPending = false;                     // Closed-loop flag
+unsigned long telemetrySentTime = 0;               // Closed-loop timeout
 uint8_t telemetryStep = 0;
 
 int liveRPM = 0;
@@ -55,8 +57,8 @@ int liveIAT = 0;
 float liveVoltage = 0.0;
 
 unsigned long lastVoltageAlertTime = 0;
-const unsigned long VOLTAGE_ALERT_COOLDOWN = 30000; // 30-second cooldown between alerts
-const float VOLTAGE_MIN_THRESHOLD = 12.5;           // Alert if running voltage drops below this
+const unsigned long VOLTAGE_ALERT_COOLDOWN = 30000; 
+const float VOLTAGE_MIN_THRESHOLD = 12.5;           
 
 // ==========================================
 // WI-FI & OTA CONFIGURATION
@@ -128,13 +130,7 @@ class MyRxCallbacks: public BLECharacteristicCallbacks {
             }
             else if (cmd == 'l' || cmd == 'L') {
                 liveTelemetryMode = !liveTelemetryMode;
-                if (liveTelemetryMode) {
-                    Serial.println("[BLE] Live Telemetry Started");
-                    bleSendLine("[SYSTEM] Live Telemetry Started");
-                } else {
-                    Serial.println("[BLE] Live Telemetry Stopped");
-                    bleSendLine("[SYSTEM] Live Telemetry Stopped");
-                }
+                requestTelemetryToggleAlert = true; // Offload heavy logic to loop()
             }
         }
     }
@@ -144,6 +140,17 @@ class MyRxCallbacks: public BLECharacteristicCallbacks {
 // LOGGING & NVS HELPERS
 // ==========================================
 void logClearedDTC(char type, uint16_t code) {
+    // 1. Deduplication Check to save flash wear
+    for (int i = 0; i < MAX_HISTORY; i++) {
+        if (dtcHistory[i].bootCount == currentBootCount &&
+            dtcHistory[i].type == type &&
+            dtcHistory[i].code == code) {
+            Serial.printf("[NVS] Code %c%04X already logged this boot cycle. Skipping flash write.\n", type, code);
+            return;
+        }
+    }
+
+    // 2. Log if it's new for this boot
     dtcHistory[historyIndex].bootCount  = currentBootCount;
     dtcHistory[historyIndex].uptimeSecs = millis() / 1000;
     dtcHistory[historyIndex].type       = type;
@@ -230,6 +237,9 @@ void enterOTAMode() {
 
     twai_stop();
     twai_driver_uninstall();
+    
+    // Shut down BLE entirely to prevent dual-radio memory crashes
+    BLEDevice::deinit(true);
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
@@ -382,6 +392,19 @@ void parseOBDResponse(const twai_message_t &msg) {
 
         if (mode == 0x41) {
             uint8_t pid = msg.data[2];
+            
+            // Handle Closed-Loop Telemetry Advancement
+            if (liveTelemetryMode) {
+                if ((telemetryStep == 0 && pid == 0x0C) ||
+                    (telemetryStep == 1 && pid == 0x05) ||
+                    (telemetryStep == 2 && pid == 0x11) ||
+                    (telemetryStep == 3 && pid == 0x0F) ||
+                    (telemetryStep == 4 && pid == 0x42)) {
+                    
+                    telemetryStep = (telemetryStep + 1) % 5;
+                    telemetryPending = false; // Unblock the next request loop
+                }
+            }
 
             if (pid == 0x0C) { // RPM
                 liveRPM = ((msg.data[3] << 8) | msg.data[4]) / 4;
@@ -414,14 +437,14 @@ void parseOBDResponse(const twai_message_t &msg) {
                         Serial.println(alertBuffer);
                     }
                 }
-            }
-
-            // Fire the telemetry string when the final PID (0x42) arrives
-            if (liveTelemetryMode && pid == 0x42) {
-                char tBuffer[128]; 
-                snprintf(tBuffer, sizeof(tBuffer), "RPM:%04d | Coolant:%dC | IAT:%dC | TPS:%02d%% | Batt:%.1fV", 
-                         liveRPM, liveTempC, liveIAT, liveTPS, liveVoltage);
-                bleSendLine(tBuffer);
+                
+                // Final PID received: Broadcast the telemetry string
+                if (liveTelemetryMode) {
+                    char tBuffer[128]; 
+                    snprintf(tBuffer, sizeof(tBuffer), "RPM:%04d | Coolant:%dC | IAT:%dC | TPS:%02d%% | Batt:%.1fV", 
+                             liveRPM, liveTempC, liveIAT, liveTPS, liveVoltage);
+                    bleSendLine(tBuffer);
+                }
             }
             return;
         }
@@ -527,17 +550,15 @@ void setup() {
 
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
 
+    // Fix: Remove flawed hardware mask logic and rely on software filtering in loop()
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-    f_config.acceptance_code = (OBD_RESPONSE_MIN << 21);
-    f_config.acceptance_mask = ~(0x7F8 << 21);
-    f_config.single_filter   = true;
 
     if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK || twai_start() != ESP_OK) {
         Serial.println("[CAN] Failed to start TWAI driver!");
         return;
     }
 
-    Serial.println("[CAN] Bus running at 500 kbps with hardware filtering.");
+    Serial.println("[CAN] Bus running at 500 kbps.");
     printDTCHistory();
 }
 
@@ -557,12 +578,37 @@ void loop() {
     }
 
     if (otaMode) {
-        ArduinoOTA.handle(); // Lock loop to Wi-Fi traffic only
+        ArduinoOTA.handle(); 
         delay(10);
         return; 
     }
 
-    // --- 2. NORMAL MOTORCYCLE STATE ---
+    // --- 2. HANDLE NON-BLOCKING BLE CALLBACKS ---
+    if (requestTelemetryToggleAlert) {
+        requestTelemetryToggleAlert = false; // Reset the flag
+        telemetryPending = false;            // Reset state machine
+        telemetryStep = 0;
+        
+        if (liveTelemetryMode) {
+            Serial.println("[BLE] Live Telemetry Started");
+            bleSendLine("[SYSTEM] Live Telemetry Started");
+        } else {
+            Serial.println("[BLE] Live Telemetry Stopped");
+            bleSendLine("[SYSTEM] Live Telemetry Stopped");
+        }
+    }
+
+    if (requestPrintHistory) {
+        printDTCHistory();
+        requestPrintHistory = false;
+    }
+
+    if (requestCSVExport) {
+        exportHistoryCSV();
+        requestCSVExport = false;
+    }
+
+    // --- 3. CAN BUS HEALTH & INCOMING MSG ---
     checkBusHealth();
 
     if (isReceivingMultiFrame && (millis() - multiFrameTimeout > MULTI_FRAME_TIMEOUT_MS)) {
@@ -590,16 +636,6 @@ void loop() {
         }
     }
 
-    if (requestPrintHistory) {
-        printDTCHistory();
-        requestPrintHistory = false;
-    }
-
-    if (requestCSVExport) {
-        exportHistoryCSV();
-        requestCSVExport = false;
-    }
-
     if (!deviceConnected && oldDeviceConnected) {
         delay(500);
         pServer->startAdvertising();
@@ -615,25 +651,17 @@ void loop() {
     // STATE MACHINE: TELEMETRY vs DTC POLLING
     // ==========================================
     if (liveTelemetryMode) {
-        if (millis() - lastTelemetryTime >= 100) {
-            lastTelemetryTime = millis();
+        // Closed-Loop Telemetry System
+        // Will only fire if the previous PID arrived OR if 250ms have passed (timeout)
+        if (!telemetryPending || (millis() - telemetrySentTime > 250)) {
+            telemetryPending = true;
+            telemetrySentTime = millis();
 
-            if (telemetryStep == 0) {
-                sendOBDRequest(0x01, 0x0C); // RPM
-                telemetryStep = 1;
-            } else if (telemetryStep == 1) {
-                sendOBDRequest(0x01, 0x05); // Coolant Temp
-                telemetryStep = 2;
-            } else if (telemetryStep == 2) {
-                sendOBDRequest(0x01, 0x11); // TPS
-                telemetryStep = 3;
-            } else if (telemetryStep == 3) {
-                sendOBDRequest(0x01, 0x0F); // Intake Air Temp
-                telemetryStep = 4;
-            } else if (telemetryStep == 4) {
-                sendOBDRequest(0x01, 0x42); // Control Module Voltage
-                telemetryStep = 0; 
-            }
+            if (telemetryStep == 0) sendOBDRequest(0x01, 0x0C);      // RPM
+            else if (telemetryStep == 1) sendOBDRequest(0x01, 0x05); // Coolant Temp
+            else if (telemetryStep == 2) sendOBDRequest(0x01, 0x11); // TPS
+            else if (telemetryStep == 3) sendOBDRequest(0x01, 0x0F); // Intake Air Temp
+            else if (telemetryStep == 4) sendOBDRequest(0x01, 0x42); // Voltage
         }
     } 
     else if (clearRequested) {
