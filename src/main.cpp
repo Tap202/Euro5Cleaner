@@ -461,10 +461,10 @@ void setup() {
 
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
 
-    // Hardware mask: Accept only 0x7E8 through 0x7EF (Standard OBD-II ECU Responses)
+   // Hardware mask: Accept only 0x7E8 through 0x7EF (Standard OBD-II ECU Responses)
     twai_filter_config_t f_config = {
-        .acceptance_code = (0x7E8 << 21), 
-        .acceptance_mask = ~(0x007 << 21), 
+        .acceptance_code = (uint32_t)(0x7E8U << 21), 
+        .acceptance_mask = (uint32_t)~(0x007U << 21), 
         .single_filter = true
     };
 
