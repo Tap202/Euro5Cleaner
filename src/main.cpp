@@ -7,8 +7,11 @@
 #include <BLE2902.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#include <WiFiManager.h> // NEW: For Captive Portal
-#include <atomic>        // NEW: For thread-safe flags
+#include <WiFiManager.h>
+#include <atomic>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
 // ==========================================
 // PIN DEFINITIONS & CAN CONFIGURATION
@@ -39,7 +42,6 @@ uint8_t rxBuffer[RX_BUFFER_SIZE];
 uint16_t rxTotalLength            = 0;
 uint16_t rxIndex                  = 0;
 uint8_t expectedSeqNum            = 1;
-uint8_t framesReceivedInBlock     = 0; // Tracks frames for Flow Control
 bool isReceivingMultiFrame        = false;
 unsigned long multiFrameTimeout   = 0;
 const unsigned long MULTI_FRAME_TIMEOUT_MS = 250;
@@ -69,6 +71,7 @@ std::atomic<bool> requestTelemetryToggleAlert(false);
 std::atomic<bool> requestOTA(false);
 std::atomic<bool> requestPrintHistory(false);
 std::atomic<bool> requestCSVExport(false);
+std::atomic<bool> telemetryUpdated(false); // NEW: Signals main loop to format string
 
 bool otaMode = false;
 
@@ -90,7 +93,7 @@ uint8_t historyIndex     = 0;
 uint32_t currentBootCount = 0;
 
 // ==========================================
-// BLE UART CONFIGURATION
+// BLE UART CONFIGURATION & RTOS QUEUE
 // ==========================================
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -101,8 +104,27 @@ BLECharacteristic *pTxCharacteristic = NULL;
 bool deviceConnected         = false;
 bool oldDeviceConnected      = false;
 
+// FreeRTOS Queue for decoupled BLE sending
+#define BLE_MSG_MAX_LEN 128
+#define BLE_MSG_QUEUE_LEN 20
+QueueHandle_t bleMsgQueue;
+
 void bleSendLine(const char* text);
 void printDTCHistory();
+
+// Dedicated task for transmitting BLE messages without blocking CAN
+void bleTxTask(void *pvParameters) {
+    char msg[BLE_MSG_MAX_LEN];
+    for (;;) {
+        if (xQueueReceive(bleMsgQueue, &msg, portMAX_DELAY) == pdPASS) {
+            if (deviceConnected && pTxCharacteristic != NULL) {
+                pTxCharacteristic->setValue((uint8_t*)msg, strlen(msg));
+                pTxCharacteristic->notify();
+                vTaskDelay(pdMS_TO_TICKS(20)); // Delay safely offloaded here
+            }
+        }
+    }
+}
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override { deviceConnected = true; }
@@ -142,7 +164,6 @@ void logClearedDTC(char type, uint16_t code) {
     dtcHistory[historyIndex].type       = type;
     dtcHistory[historyIndex].code       = code;
 
-    // Write ONLY the updated record to save flash wear
     char key[10];
     snprintf(key, sizeof(key), "dtc_%d", historyIndex);
     preferences.putBytes(key, &dtcHistory[historyIndex], sizeof(DTCRecord));
@@ -153,11 +174,12 @@ void logClearedDTC(char type, uint16_t code) {
     Serial.printf("[NVS] Logged code %c%04X to flash.\n", type, code);
 }
 
+// Thread-safe, non-blocking queue push for BLE messages
 void bleSendLine(const char* text) {
-    if (deviceConnected && pTxCharacteristic != NULL) {
-        pTxCharacteristic->setValue((uint8_t*)text, strlen(text));
-        pTxCharacteristic->notify();
-        vTaskDelay(pdMS_TO_TICKS(20)); 
+    if (bleMsgQueue != NULL) {
+        char buffer[BLE_MSG_MAX_LEN] = {0};
+        strncpy(buffer, text, BLE_MSG_MAX_LEN - 1);
+        xQueueSend(bleMsgQueue, buffer, 0); 
     }
 }
 
@@ -214,7 +236,6 @@ void enterOTAMode() {
     WiFiManager wm;
     Serial.println("[OTA] Starting WiFiManager...");
     
-    // Captive Portal if it can't find saved credentials
     if (!wm.autoConnect("MT09_OTA_Setup")) {
         Serial.println("[OTA] Failed to connect. Rebooting...");
         delay(1000);
@@ -271,7 +292,7 @@ void sendFlowControl(bool abort = false) {
         for (int i = 1; i < 8; i++) fc.data[i] = 0xAA;
     } else {
         fc.data[0] = 0x30; // Flow Control - Continue
-        fc.data[1] = 0x08; // Block Size: 8 frames before next FC
+        fc.data[1] = 0x00; // Block Size: 0 (Send all remaining frames continuously)
         fc.data[2] = 0x14; // Separation Time: 20ms
         for (int i = 3; i < 8; i++) fc.data[i] = 0xAA;
     }
@@ -348,6 +369,8 @@ void parseOBDResponse(const twai_message_t &msg) {
             else if (pid == 0x0F) liveIAT = msg.data[3] - 40;
             else if (pid == 0x42) { 
                 liveVoltage = ((msg.data[3] << 8) | msg.data[4]) / 1000.0;
+                
+                // Alert check pushed to queue directly
                 if (liveRPM > 800 && liveVoltage < VOLTAGE_MIN_THRESHOLD && 
                     millis() - lastVoltageAlertTime >= VOLTAGE_ALERT_COOLDOWN) {
                     lastVoltageAlertTime = millis();
@@ -356,11 +379,9 @@ void parseOBDResponse(const twai_message_t &msg) {
                     bleSendLine(alert);
                 }
                 
+                // Signal main loop to build and send the telemetry string
                 if (liveTelemetryMode) {
-                    char tBuffer[128]; 
-                    snprintf(tBuffer, sizeof(tBuffer), "RPM:%04d | Coolant:%dC | IAT:%dC | TPS:%02d%% | Batt:%.1fV", 
-                             liveRPM, liveTempC, liveIAT, liveTPS, liveVoltage);
-                    bleSendLine(tBuffer);
+                    telemetryUpdated = true; 
                 }
             }
             return;
@@ -385,7 +406,6 @@ void parseOBDResponse(const twai_message_t &msg) {
 
             isReceivingMultiFrame = true;
             expectedSeqNum = 1;
-            framesReceivedInBlock = 0;
             multiFrameTimeout = millis();
             sendFlowControl(false);
         }
@@ -404,17 +424,13 @@ void parseOBDResponse(const twai_message_t &msg) {
         }
 
         expectedSeqNum = (expectedSeqNum + 1) & 0x0F;
-        framesReceivedInBlock++;
         multiFrameTimeout = millis();
 
         if (rxIndex >= rxTotalLength) {
             isReceivingMultiFrame = false;
             processDTCs(rxBuffer, rxTotalLength);
-        } else if (framesReceivedInBlock >= 8) {
-            // Re-authorize next block of 8 frames
-            framesReceivedInBlock = 0;
-            sendFlowControl(false);
         }
+        // Re-authorization block removed since Block Size is 0
     }
 }
 
@@ -425,7 +441,11 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    // 1. Initialize NVS (Load individually)
+    // 1. Initialize FreeRTOS Queue and BLE Task
+    bleMsgQueue = xQueueCreate(BLE_MSG_QUEUE_LEN, BLE_MSG_MAX_LEN);
+    xTaskCreate(bleTxTask, "BLE_TX_Task", 4096, NULL, 1, NULL);
+
+    // 2. Initialize NVS (Load individually)
     preferences.begin("obd_data", false);
     currentBootCount = preferences.getUInt("boot_cnt", 0) + 1;
     preferences.putUInt("boot_cnt", currentBootCount);
@@ -437,7 +457,7 @@ void setup() {
     }
     historyIndex = preferences.getUChar("hist_idx", 0);
 
-    // 2. Initialize BLE
+    // 3. Initialize BLE
     BLEDevice::setMTU(517); 
     BLEDevice::init("MT09_OBD_BLE");
     pServer = BLEDevice::createServer();
@@ -453,7 +473,7 @@ void setup() {
     pService->start();
     pServer->getAdvertising()->start();
 
-    // 3. Initialize CAN/TWAI Driver with Hardware Filtering
+    // 4. Initialize CAN/TWAI Driver with Hardware Filtering
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
     g_config.rx_queue_len = 50; 
     g_config.tx_queue_len = 10;
@@ -461,7 +481,6 @@ void setup() {
 
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
 
-   // Hardware mask: Accept only 0x7E8 through 0x7EF (Standard OBD-II ECU Responses)
     twai_filter_config_t f_config = {
         .acceptance_code = (uint32_t)(0x7E8U << 21), 
         .acceptance_mask = (uint32_t)~(0x007U << 21), 
@@ -501,6 +520,14 @@ void loop() {
 
     checkBusHealth();
 
+    // Handle telemetry string formatting outside the CAN parser
+    if (telemetryUpdated.exchange(false) && liveTelemetryMode) {
+        char tBuffer[128]; 
+        snprintf(tBuffer, sizeof(tBuffer), "RPM:%04d | Coolant:%dC | IAT:%dC | TPS:%02d%% | Batt:%.1fV", 
+                 liveRPM, liveTempC, liveIAT, liveTPS, liveVoltage);
+        bleSendLine(tBuffer);
+    }
+
     if (isReceivingMultiFrame && (millis() - multiFrameTimeout > MULTI_FRAME_TIMEOUT_MS)) {
         isReceivingMultiFrame = false;
         rxIndex = 0;
@@ -508,6 +535,7 @@ void loop() {
     }
 
     twai_message_t rx_msg;
+    // Quickly drain the TWAI queue
     while (twai_receive(&rx_msg, pdMS_TO_TICKS(1)) == ESP_OK) {
         lastCanRxTime = millis(); 
         parseOBDResponse(rx_msg); 
