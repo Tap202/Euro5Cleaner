@@ -64,6 +64,8 @@ unsigned long lastVoltageAlertTime = 0;
 const unsigned long VOLTAGE_ALERT_COOLDOWN = 30000; 
 const float VOLTAGE_MIN_THRESHOLD = 12.5;           
 
+bool nvsWritePending = false;
+
 // ==========================================
 // THREAD-SAFE FLAGS (RTOS & BLE CALLBACKS)
 // ==========================================
@@ -106,7 +108,7 @@ bool oldDeviceConnected      = false;
 
 // FreeRTOS Queue for decoupled BLE sending
 #define BLE_MSG_MAX_LEN 128
-#define BLE_MSG_QUEUE_LEN 50 // [FIX] Increased buffer size to support full CSV dumps
+#define BLE_MSG_QUEUE_LEN 50 
 QueueHandle_t bleMsgQueue;
 
 void bleSendLine(const char* text);
@@ -154,7 +156,7 @@ void logClearedDTC(char type, uint16_t code) {
     for (int i = 0; i < MAX_HISTORY; i++) {
         if (dtcHistory[i].bootCount == currentBootCount &&
             dtcHistory[i].type == type && dtcHistory[i].code == code) {
-            Serial.printf("[NVS] Code %c%04X already logged this boot cycle.\n", type, code);
+            Serial.printf("[RAM] Code %c%04X already logged this boot cycle.\n", type, code);
             return;
         }
     }
@@ -164,14 +166,21 @@ void logClearedDTC(char type, uint16_t code) {
     dtcHistory[historyIndex].type       = type;
     dtcHistory[historyIndex].code       = code;
 
-    char key[10];
-    snprintf(key, sizeof(key), "dtc_%d", historyIndex);
-    preferences.putBytes(key, &dtcHistory[historyIndex], sizeof(DTCRecord));
-    
     historyIndex = (historyIndex + 1) % MAX_HISTORY;
-    preferences.putUChar("hist_idx", historyIndex);
+    
+    nvsWritePending = true;
+    Serial.printf("[RAM] Logged code %c%04X to memory (pending flash).\n", type, code);
+}
 
-    Serial.printf("[NVS] Logged code %c%04X to flash.\n", type, code);
+void commitDTCHistory() {
+    for (int i = 0; i < MAX_HISTORY; i++) {
+        char key[10];
+        snprintf(key, sizeof(key), "dtc_%d", i);
+        preferences.putBytes(key, &dtcHistory[i], sizeof(DTCRecord));
+    }
+    preferences.putUChar("hist_idx", historyIndex);
+    nvsWritePending = false;
+    Serial.println("[NVS] Successfully committed pending DTCs to flash.");
 }
 
 // Thread-safe, non-blocking queue push for BLE messages
@@ -179,7 +188,6 @@ void bleSendLine(const char* text) {
     if (bleMsgQueue != NULL) {
         char buffer[BLE_MSG_MAX_LEN] = {0};
         strncpy(buffer, text, BLE_MSG_MAX_LEN - 1);
-        // [FIX] Wait up to 10 ticks for space, applying backpressure to avoid dropped messages
         xQueueSend(bleMsgQueue, buffer, pdMS_TO_TICKS(10)); 
     }
 }
@@ -237,7 +245,6 @@ void enterOTAMode() {
     WiFiManager wm;
     Serial.println("[OTA] Starting WiFiManager...");
     
-    // [FIX] Implement timeout to prevent endless hanging and Task WDT panics
     wm.setConfigPortalTimeout(120);
     
     if (!wm.autoConnect("MT09_OTA_Setup")) {
@@ -322,11 +329,15 @@ void checkBusHealth() {
 // DTC & OBD PROCESSING
 // ==========================================
 
-// [FIX] Now strictly expects a buffer starting precisely at DTC1_H
-void processDTCs(const uint8_t* dtcBuffer, uint8_t numCodes) {
+void processDTCs(const uint8_t* dtcBuffer, uint8_t numCodes, uint16_t bufferLen) {
     bool faultMatched = false;
 
     for (int i = 0; i < numCodes; i++) {
+        if ((i * 2) + 1 >= bufferLen) {
+            Serial.println("[WARN] DTC buffer overflow prevented.");
+            break; 
+        }
+
         uint8_t b1 = dtcBuffer[i * 2];
         uint8_t b2 = dtcBuffer[(i * 2) + 1];
         if (b1 == 0 && b2 == 0) continue;
@@ -391,9 +402,8 @@ void parseOBDResponse(const twai_message_t &msg) {
         if (mode == 0x43 || mode == 0x47) {
             uint8_t dataLen = msg.data[0] & 0x0F;
             if (dataLen >= 3) {
-                // [FIX] Explicitly pass the number of codes and offset the buffer to DTC1
                 uint8_t numCodes = msg.data[2];
-                processDTCs(&msg.data[3], numCodes);
+                processDTCs(&msg.data[3], numCodes, 5); 
             }
         }
     }
@@ -434,8 +444,7 @@ void parseOBDResponse(const twai_message_t &msg) {
 
         if (rxIndex >= rxTotalLength) {
             isReceivingMultiFrame = false;
-            // [FIX] rxBuffer[0] = Mode, rxBuffer[1] = Num Codes, rxBuffer[2] = DTC1_H
-            processDTCs(&rxBuffer[2], rxBuffer[1]);
+            processDTCs(&rxBuffer[2], rxBuffer[1], rxTotalLength - 2); 
         }
     }
 }
@@ -449,7 +458,6 @@ void setup() {
 
     // 1. Initialize FreeRTOS Queue and BLE Task
     bleMsgQueue = xQueueCreate(BLE_MSG_QUEUE_LEN, BLE_MSG_MAX_LEN);
-    // [FIX] Pin the BLE transmission task to Core 0 to prevent main loop CAN stuttering on Core 1
     xTaskCreatePinnedToCore(bleTxTask, "BLE_TX_Task", 4096, NULL, 1, NULL, 0);
 
     // 2. Initialize NVS (Load individually)
@@ -540,14 +548,20 @@ void loop() {
     }
 
     twai_message_t rx_msg;
-    while (twai_receive(&rx_msg, pdMS_TO_TICKS(1)) == ESP_OK) {
+    uint8_t msgCount = 0; 
+    while (twai_receive(&rx_msg, pdMS_TO_TICKS(1)) == ESP_OK && msgCount < 15) {
         lastCanRxTime = millis(); 
         parseOBDResponse(rx_msg); 
+        msgCount++;
     }
 
     if (millis() - lastCanRxTime > 3000) {
         if (liveRPM > 0) liveRPM = 0; 
         if (clearRequested) clearRequested = false; 
+    }
+
+    if (nvsWritePending && liveRPM == 0) {
+        commitDTCHistory();
     }
 
     if (!deviceConnected && oldDeviceConnected) {
