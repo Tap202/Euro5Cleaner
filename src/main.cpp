@@ -71,7 +71,7 @@ std::atomic<bool> requestTelemetryToggleAlert(false);
 std::atomic<bool> requestOTA(false);
 std::atomic<bool> requestPrintHistory(false);
 std::atomic<bool> requestCSVExport(false);
-std::atomic<bool> telemetryUpdated(false); // NEW: Signals main loop to format string
+std::atomic<bool> telemetryUpdated(false);
 
 bool otaMode = false;
 
@@ -106,7 +106,7 @@ bool oldDeviceConnected      = false;
 
 // FreeRTOS Queue for decoupled BLE sending
 #define BLE_MSG_MAX_LEN 128
-#define BLE_MSG_QUEUE_LEN 20
+#define BLE_MSG_QUEUE_LEN 50 // [FIX] Increased buffer size to support full CSV dumps
 QueueHandle_t bleMsgQueue;
 
 void bleSendLine(const char* text);
@@ -120,7 +120,7 @@ void bleTxTask(void *pvParameters) {
             if (deviceConnected && pTxCharacteristic != NULL) {
                 pTxCharacteristic->setValue((uint8_t*)msg, strlen(msg));
                 pTxCharacteristic->notify();
-                vTaskDelay(pdMS_TO_TICKS(20)); // Delay safely offloaded here
+                vTaskDelay(pdMS_TO_TICKS(20));
             }
         }
     }
@@ -179,7 +179,8 @@ void bleSendLine(const char* text) {
     if (bleMsgQueue != NULL) {
         char buffer[BLE_MSG_MAX_LEN] = {0};
         strncpy(buffer, text, BLE_MSG_MAX_LEN - 1);
-        xQueueSend(bleMsgQueue, buffer, 0); 
+        // [FIX] Wait up to 10 ticks for space, applying backpressure to avoid dropped messages
+        xQueueSend(bleMsgQueue, buffer, pdMS_TO_TICKS(10)); 
     }
 }
 
@@ -236,8 +237,11 @@ void enterOTAMode() {
     WiFiManager wm;
     Serial.println("[OTA] Starting WiFiManager...");
     
+    // [FIX] Implement timeout to prevent endless hanging and Task WDT panics
+    wm.setConfigPortalTimeout(120);
+    
     if (!wm.autoConnect("MT09_OTA_Setup")) {
-        Serial.println("[OTA] Failed to connect. Rebooting...");
+        Serial.println("[OTA] Failed to connect or timeout hit. Rebooting...");
         delay(1000);
         ESP.restart();
     }
@@ -317,14 +321,14 @@ void checkBusHealth() {
 // ==========================================
 // DTC & OBD PROCESSING
 // ==========================================
-void processDTCs(const uint8_t* payload, int payloadLength) {
-    int numBytes = payloadLength - 1; 
-    int numCodes = numBytes / 2;
+
+// [FIX] Now strictly expects a buffer starting precisely at DTC1_H
+void processDTCs(const uint8_t* dtcBuffer, uint8_t numCodes) {
     bool faultMatched = false;
 
     for (int i = 0; i < numCodes; i++) {
-        int offset = 1 + (i * 2);
-        uint8_t b1 = payload[offset], b2 = payload[offset + 1];
+        uint8_t b1 = dtcBuffer[i * 2];
+        uint8_t b2 = dtcBuffer[(i * 2) + 1];
         if (b1 == 0 && b2 == 0) continue;
 
         char typeChar = "PCBU"[(b1 >> 6) & 0x03];
@@ -370,7 +374,6 @@ void parseOBDResponse(const twai_message_t &msg) {
             else if (pid == 0x42) { 
                 liveVoltage = ((msg.data[3] << 8) | msg.data[4]) / 1000.0;
                 
-                // Alert check pushed to queue directly
                 if (liveRPM > 800 && liveVoltage < VOLTAGE_MIN_THRESHOLD && 
                     millis() - lastVoltageAlertTime >= VOLTAGE_ALERT_COOLDOWN) {
                     lastVoltageAlertTime = millis();
@@ -379,7 +382,6 @@ void parseOBDResponse(const twai_message_t &msg) {
                     bleSendLine(alert);
                 }
                 
-                // Signal main loop to build and send the telemetry string
                 if (liveTelemetryMode) {
                     telemetryUpdated = true; 
                 }
@@ -388,7 +390,11 @@ void parseOBDResponse(const twai_message_t &msg) {
         }
         if (mode == 0x43 || mode == 0x47) {
             uint8_t dataLen = msg.data[0] & 0x0F;
-            if (dataLen >= 3) processDTCs(&msg.data[1], dataLen);
+            if (dataLen >= 3) {
+                // [FIX] Explicitly pass the number of codes and offset the buffer to DTC1
+                uint8_t numCodes = msg.data[2];
+                processDTCs(&msg.data[3], numCodes);
+            }
         }
     }
     else if (pciType == 0x1) { // First Frame
@@ -428,9 +434,9 @@ void parseOBDResponse(const twai_message_t &msg) {
 
         if (rxIndex >= rxTotalLength) {
             isReceivingMultiFrame = false;
-            processDTCs(rxBuffer, rxTotalLength);
+            // [FIX] rxBuffer[0] = Mode, rxBuffer[1] = Num Codes, rxBuffer[2] = DTC1_H
+            processDTCs(&rxBuffer[2], rxBuffer[1]);
         }
-        // Re-authorization block removed since Block Size is 0
     }
 }
 
@@ -443,7 +449,8 @@ void setup() {
 
     // 1. Initialize FreeRTOS Queue and BLE Task
     bleMsgQueue = xQueueCreate(BLE_MSG_QUEUE_LEN, BLE_MSG_MAX_LEN);
-    xTaskCreate(bleTxTask, "BLE_TX_Task", 4096, NULL, 1, NULL);
+    // [FIX] Pin the BLE transmission task to Core 0 to prevent main loop CAN stuttering on Core 1
+    xTaskCreatePinnedToCore(bleTxTask, "BLE_TX_Task", 4096, NULL, 1, NULL, 0);
 
     // 2. Initialize NVS (Load individually)
     preferences.begin("obd_data", false);
@@ -497,7 +504,6 @@ void setup() {
 // MAIN LOOP
 // ==========================================
 void loop() {
-    // Check Atomics first
     if (requestOTA.exchange(false)) {
         if (liveRPM > 0 && liveTelemetryMode) bleSendLine("[ERROR] Engine is running!");
         else enterOTAMode();
@@ -520,7 +526,6 @@ void loop() {
 
     checkBusHealth();
 
-    // Handle telemetry string formatting outside the CAN parser
     if (telemetryUpdated.exchange(false) && liveTelemetryMode) {
         char tBuffer[128]; 
         snprintf(tBuffer, sizeof(tBuffer), "RPM:%04d | Coolant:%dC | IAT:%dC | TPS:%02d%% | Batt:%.1fV", 
@@ -535,7 +540,6 @@ void loop() {
     }
 
     twai_message_t rx_msg;
-    // Quickly drain the TWAI queue
     while (twai_receive(&rx_msg, pdMS_TO_TICKS(1)) == ESP_OK) {
         lastCanRxTime = millis(); 
         parseOBDResponse(rx_msg); 
