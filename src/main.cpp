@@ -16,8 +16,8 @@
 // ==========================================
 // PIN DEFINITIONS & CAN CONFIGURATION
 // ==========================================
-#define CAN_TX_PIN GPIO_NUM_5
-#define CAN_RX_PIN GPIO_NUM_4
+#define CAN_TX_PIN GPIO_NUM_21
+#define CAN_RX_PIN GPIO_NUM_3
 
 #define OBD_BROADCAST_ID 0x7DF
 #define OBD_PHYSICAL_ID  0x7E0
