@@ -1,12 +1,11 @@
 #include <Arduino.h>
 #include "driver/twai.h"
 
-// =====================================================
-// ESP32 <-> SN65HVD230
-// =====================================================
-
-#define CAN_TX_PIN GPIO_NUM_5
-#define CAN_RX_PIN GPIO_NUM_4
+// ==========================================
+// PIN DEFINITIONS & CAN CONFIGURATION
+// ==========================================
+#define CAN_TX_PIN GPIO_NUM_21
+#define CAN_RX_PIN GPIO_NUM_3
 
 // MT-09 CAN is reported as 500 kbit/s
 // =====================================================
