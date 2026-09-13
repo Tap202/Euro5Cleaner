@@ -1,601 +1,603 @@
+/**
+ * =============================================================================
+ * 🏍️ Yamaha MT-09 SP Euro 5+ CAN Bus Sniffer
+ * Platform: ESP32-C3 Super Mini Plus (Native USB CDC)
+ * =============================================================================
+ * 
+ * Features:
+ *  - TWAI Driver with safe LISTEN-ONLY mode (no ACKs, no bus disruption)
+ *  - Interactive Serial CLI over Native USB-C CDC (115200 baud)
+ *  - Dual Stream Output:
+ *      1. Human-Readable Monitor (with interval delta, frequency & ASCII)
+ *      2. SLCAN / Lawicel Mode (Plug-and-play for SavvyCAN, Wireshark, etc.)
+ *  - Unique CAN ID Discovery & Statistics Tracker ('u' command)
+ *  - On-the-fly Baud Rate Switching (500k, 250k, 1M, 125k) ('b' command)
+ *  - Single ID Focus / Filter ('f' command)
+ *  - Non-blocking LED Activity Indicator (GPIO 8)
+ * =============================================================================
+ */
+
 #include <Arduino.h>
 #include "driver/twai.h"
-#include <Preferences.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include <WiFi.h>
-#include <ArduinoOTA.h>
-#include <WiFiManager.h>
-#include <atomic>
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/task.h"
 
-// ==========================================
-// PIN DEFINITIONS & CAN CONFIGURATION
-// ==========================================
-#define CAN_TX_PIN GPIO_NUM_5
-#define CAN_RX_PIN GPIO_NUM_4
+// =============================================================================
+// HARDWARE PIN DEFINITIONS (ESP32-C3 Super Mini Plus)
+// =============================================================================
+#define CAN_TX_PIN         GPIO_NUM_21
+#define CAN_RX_PIN         GPIO_NUM_3
 
-#define OBD_BROADCAST_ID 0x7DF
-#define OBD_PHYSICAL_ID  0x7E0
-#define OBD_RESPONSE_MIN 0x7E8
-#define OBD_RESPONSE_MAX 0x7EF
+// Onboard User LED on ESP32-C3 Super Mini is typically GPIO 8 (Active LOW)
+#define ONBOARD_LED_PIN    8
+#define LED_ACTIVE_LOW     true
 
-const unsigned long POLL_INTERVAL      = 5000;
-const unsigned long CLEAR_COOLDOWN     = 30000;
-const unsigned long RPM_POLL_INTERVAL  = 2000;
-
-unsigned long lastPollTime        = 0;
-unsigned long lastClearTime       = (unsigned long)-CLEAR_COOLDOWN; 
-unsigned long lastRpmRequestTime  = 0;
-unsigned long lastCanRxTime       = 0;
-bool clearRequested               = false;
-
-// ==========================================
-// ISO-TP MULTI-FRAME BUFFER
-// ==========================================
-#define RX_BUFFER_SIZE 128
-uint8_t rxBuffer[RX_BUFFER_SIZE];
-uint16_t rxTotalLength            = 0;
-uint16_t rxIndex                  = 0;
-uint8_t expectedSeqNum            = 1;
-bool isReceivingMultiFrame        = false;
-unsigned long multiFrameTimeout   = 0;
-const unsigned long MULTI_FRAME_TIMEOUT_MS = 250;
-
-// ==========================================
-// LIVE TELEMETRY VARIABLES
-// ==========================================
-bool liveTelemetryMode = false;
-bool telemetryPending = false;                     
-unsigned long telemetrySentTime = 0;               
-uint8_t telemetryStep = 0;
-
-int liveRPM = 0;
-int liveTempC = 0;
-int liveTPS = 0;
-int liveIAT = 0;
-float liveVoltage = 0.0;
-
-unsigned long lastVoltageAlertTime = 0;
-const unsigned long VOLTAGE_ALERT_COOLDOWN = 30000; 
-const float VOLTAGE_MIN_THRESHOLD = 12.5;           
-
-bool nvsWritePending = false;
-
-// ==========================================
-// THREAD-SAFE FLAGS (RTOS & BLE CALLBACKS)
-// ==========================================
-std::atomic<bool> requestTelemetryToggleAlert(false);
-std::atomic<bool> requestOTA(false);
-std::atomic<bool> requestPrintHistory(false);
-std::atomic<bool> requestCSVExport(false);
-std::atomic<bool> telemetryUpdated(false);
-
-bool otaMode = false;
-
-// ==========================================
-// NVS STORAGE (PREFERENCES)
-// ==========================================
-Preferences preferences;
-
-struct DTCRecord {
-    uint32_t bootCount;
-    uint32_t uptimeSecs;
-    char type;        
-    uint16_t code;    
+// =============================================================================
+// CAN BAUD RATES & MODES
+// =============================================================================
+enum CanBaudRate {
+    BAUD_500K = 0,   // Standard for Yamaha Euro 5 / ISO 19689 OBD-II
+    BAUD_250K = 1,   // Sub-bus / legacy OBD
+    BAUD_1M   = 2,   // High-speed powertrain CAN
+    BAUD_125K = 3,   // Low-speed body / diagnostic
+    BAUD_COUNT = 4
 };
 
-#define MAX_HISTORY 10
-DTCRecord dtcHistory[MAX_HISTORY];
-uint8_t historyIndex     = 0;
-uint32_t currentBootCount = 0;
-
-// ==========================================
-// BLE UART CONFIGURATION & RTOS QUEUE
-// ==========================================
-#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
-
-BLEServer *pServer = NULL;
-BLECharacteristic *pTxCharacteristic = NULL;
-bool deviceConnected         = false;
-bool oldDeviceConnected      = false;
-
-// FreeRTOS Queue for decoupled BLE sending
-#define BLE_MSG_MAX_LEN 128
-#define BLE_MSG_QUEUE_LEN 50 
-QueueHandle_t bleMsgQueue;
-
-void bleSendLine(const char* text);
-void printDTCHistory();
-
-// Dedicated task for transmitting BLE messages without blocking CAN
-void bleTxTask(void *pvParameters) {
-    char msg[BLE_MSG_MAX_LEN];
-    for (;;) {
-        if (xQueueReceive(bleMsgQueue, &msg, portMAX_DELAY) == pdPASS) {
-            if (deviceConnected && pTxCharacteristic != NULL) {
-                pTxCharacteristic->setValue((uint8_t*)msg, strlen(msg));
-                pTxCharacteristic->notify();
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-        }
-    }
-}
-
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) override { deviceConnected = true; }
-    void onDisconnect(BLEServer* pServer) override { deviceConnected = false; }
+const char* BAUD_NAMES[BAUD_COUNT] = {
+    "500 kbps (Euro 5 Standard)",
+    "250 kbps",
+    "1000 kbps (1 Mbps)",
+    "125 kbps"
 };
 
-class MyRxCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) override {
-        std::string rxValue = pCharacteristic->getValue();
-        if (rxValue.length() > 0) {
-            char cmd = rxValue[0];
-            if (cmd == 'h' || cmd == 'H' || cmd == '?') requestPrintHistory = true;
-            else if (cmd == 'u' || cmd == 'U') requestOTA = true;
-            else if (cmd == 'c' || cmd == 'C') requestCSVExport = true;
-            else if (cmd == 'l' || cmd == 'L') {
-                liveTelemetryMode = !liveTelemetryMode;
-                requestTelemetryToggleAlert = true; 
-            }
-        }
-    }
+CanBaudRate currentBaud = BAUD_500K;
+bool listenOnlyMode = true; // Safe passive sniffing by default (no dominant bits/ACKs sent)
+bool twaiInstalled = false;
+bool twaiRunning = false;
+
+// =============================================================================
+// OUTPUT MODES & STREAM CONTROLS
+// =============================================================================
+enum OutputMode {
+    OUTPUT_HUMAN = 0, // Formatted text for terminal / Serial Monitor
+    OUTPUT_SLCAN = 1  // Lawicel ASCII protocol for SavvyCAN / Wireshark
 };
 
-// ==========================================
-// LOGGING & NVS HELPERS
-// ==========================================
-void logClearedDTC(char type, uint16_t code) {
-    for (int i = 0; i < MAX_HISTORY; i++) {
-        if (dtcHistory[i].bootCount == currentBootCount &&
-            dtcHistory[i].type == type && dtcHistory[i].code == code) {
-            Serial.printf("[RAM] Code %c%04X already logged this boot cycle.\n", type, code);
-            return;
-        }
-    }
+OutputMode currentOutputMode = OUTPUT_HUMAN;
+bool streamPaused = false;
+uint32_t filterId = 0;       // 0 = no filter (all IDs allowed)
+bool filterActive = false;
 
-    dtcHistory[historyIndex].bootCount  = currentBootCount;
-    dtcHistory[historyIndex].uptimeSecs = millis() / 1000;
-    dtcHistory[historyIndex].type       = type;
-    dtcHistory[historyIndex].code       = code;
+// =============================================================================
+// UNIQUE CAN ID TRACKER
+// =============================================================================
+#define MAX_UNIQUE_IDS 96
 
-    historyIndex = (historyIndex + 1) % MAX_HISTORY;
-    
-    nvsWritePending = true;
-    Serial.printf("[RAM] Logged code %c%04X to memory (pending flash).\n", type, code);
-}
+struct CanIdStats {
+    uint32_t id;
+    bool isExtended;
+    uint32_t count;
+    uint32_t lastSeenMs;
+    uint32_t lastIntervalMs;
+    uint8_t dlc;
+    uint8_t lastData[8];
+};
 
-void commitDTCHistory() {
-    for (int i = 0; i < MAX_HISTORY; i++) {
-        char key[10];
-        snprintf(key, sizeof(key), "dtc_%d", i);
-        preferences.putBytes(key, &dtcHistory[i], sizeof(DTCRecord));
-    }
-    preferences.putUChar("hist_idx", historyIndex);
-    nvsWritePending = false;
-    Serial.println("[NVS] Successfully committed pending DTCs to flash.");
-}
+CanIdStats uniqueIds[MAX_UNIQUE_IDS];
+uint16_t uniqueIdCount = 0;
 
-// Thread-safe, non-blocking queue push for BLE messages
-void bleSendLine(const char* text) {
-    if (bleMsgQueue != NULL) {
-        char buffer[BLE_MSG_MAX_LEN] = {0};
-        strncpy(buffer, text, BLE_MSG_MAX_LEN - 1);
-        xQueueSend(bleMsgQueue, buffer, pdMS_TO_TICKS(10)); 
-    }
-}
+// Bus Statistics
+uint32_t totalFramesRx = 0;
+uint32_t framesLastSecond = 0;
+uint32_t currentFps = 0;
+unsigned long lastFpsCalcMs = 0;
+uint32_t busErrorCount = 0;
+uint32_t rxOverrunCount = 0;
 
-void printDTCHistory() {
-    Serial.println("\n--- Cleared DTC History ---");
-    bleSendLine("\n--- Cleared DTC History ---");
+// LED Blink state
+unsigned long ledTurnOffMs = 0;
 
-    bool empty = true;
-    for (int i = 0; i < MAX_HISTORY; i++) {
-        int readIndex = (historyIndex + i) % MAX_HISTORY;
-        if (dtcHistory[readIndex].bootCount == 0) continue;
+// =============================================================================
+// FORWARD DECLARATIONS
+// =============================================================================
+bool initTWAI(CanBaudRate baud, bool listenOnly);
+void stopTWAI();
+void printBanner();
+void printHelp();
+void printStats();
+void printUniqueIdsTable();
+void processSerialInput();
+void handleFrame(const twai_message_t &rxMsg);
+void triggerLedActivity();
 
-        empty = false;
-        char buffer[96];
-        snprintf(buffer, sizeof(buffer), "Ride #%u | %us | Code: %c%04X",
-                 dtcHistory[readIndex].bootCount, dtcHistory[readIndex].uptimeSecs,
-                 dtcHistory[readIndex].type, dtcHistory[readIndex].code);
-
-        Serial.println(buffer);
-        bleSendLine(buffer);
-    }
-    if (empty) bleSendLine("No codes cleared yet.");
-}
-
-void exportHistoryCSV() {
-    bleSendLine("BootCount,Uptime(s),DTC_Cleared");
-    bool empty = true;
-    for (int i = 0; i < MAX_HISTORY; i++) {
-        int readIndex = (historyIndex + i) % MAX_HISTORY;
-        if (dtcHistory[readIndex].bootCount == 0) continue;
-        empty = false;
-        char buffer[64];
-        snprintf(buffer, sizeof(buffer), "%u,%u,%c%04X",
-                 dtcHistory[readIndex].bootCount, dtcHistory[readIndex].uptimeSecs,
-                 dtcHistory[readIndex].type, dtcHistory[readIndex].code);
-        bleSendLine(buffer);
-    }
-    if (empty) bleSendLine("No data,0,N/A");
-    bleSendLine("---END OF CSV---");
-}
-
-// ==========================================
-// OTA (OVER-THE-AIR) UPDATE MODE
-// ==========================================
-void enterOTAMode() {
-    Serial.println("\n[OTA] Update mode requested! Shutting down CAN and BLE...");
-    bleSendLine("Rebooting into Wi-Fi OTA mode...");
-    delay(500); 
-
-    twai_stop();
-    twai_driver_uninstall();
-    BLEDevice::deinit(true);
-
-    WiFiManager wm;
-    Serial.println("[OTA] Starting WiFiManager...");
-    
-    wm.setConfigPortalTimeout(120);
-    
-    if (!wm.autoConnect("MT09_OTA_Setup")) {
-        Serial.println("[OTA] Failed to connect or timeout hit. Rebooting...");
-        delay(1000);
-        ESP.restart();
-    }
-
-    Serial.print("\n[OTA] Wi-Fi Connected! IP Address: ");
-    Serial.println(WiFi.localIP());
-
-    ArduinoOTA.setHostname("MT09_OBD_Tool");
-    ArduinoOTA.setPassword("Mt09Sp2026!"); 
-
-    ArduinoOTA.onStart([]() { Serial.println("[OTA] Start updating"); });
-    ArduinoOTA.onEnd([]() { Serial.println("\n[OTA] Success! Rebooting..."); });
-    ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
-        Serial.printf("[OTA] Progress: %u%%\r", (p / (t / 100)));
-    });
-    ArduinoOTA.onError([](ota_error_t error) { ESP.restart(); });
-
-    ArduinoOTA.begin();
-    otaMode = true;
-}
-
-// ==========================================
-// CAN / TWAI TRANSMISSION
-// ==========================================
-void sendOBDRequest(uint8_t mode, uint8_t pid = 0xFF, uint32_t target_id = OBD_BROADCAST_ID) {
-    twai_message_t request;
-    request.identifier = target_id;
-    request.extd = 0;
-    request.data_length_code = 8;
-
-    if (mode == 0x03 || mode == 0x04) {
-        request.data[0] = 0x01;
-        request.data[1] = mode;
-        for (int i = 2; i < 8; i++) request.data[i] = 0xAA; 
-    } else {
-        request.data[0] = 0x02;
-        request.data[1] = mode;
-        request.data[2] = pid;
-        for (int i = 3; i < 8; i++) request.data[i] = 0xAA;
-    }
-    twai_transmit(&request, pdMS_TO_TICKS(50));
-}
-
-void sendFlowControl(bool abort = false) {
-    twai_message_t fc;
-    fc.identifier = OBD_PHYSICAL_ID;
-    fc.extd = 0;
-    fc.data_length_code = 8;
-    
-    if (abort) {
-        fc.data[0] = 0x32; // Flow Control - Abort
-        for (int i = 1; i < 8; i++) fc.data[i] = 0xAA;
-    } else {
-        fc.data[0] = 0x30; // Flow Control - Continue
-        fc.data[1] = 0x00; // Block Size: 0 (Send all remaining frames continuously)
-        fc.data[2] = 0x14; // Separation Time: 20ms
-        for (int i = 3; i < 8; i++) fc.data[i] = 0xAA;
-    }
-
-    twai_transmit(&fc, pdMS_TO_TICKS(50));
-}
-
-void executeClear() {
-    sendOBDRequest(0x04, 0xFF, OBD_PHYSICAL_ID);
-    lastClearTime = millis();
-    clearRequested = false;
-}
-
-void checkBusHealth() {
-    uint32_t alerts = 0;
-    if (twai_read_alerts(&alerts, 0) == ESP_OK) {
-        if (alerts & TWAI_ALERT_BUS_OFF) twai_initiate_recovery();
-        if (alerts & TWAI_ALERT_BUS_RECOVERED) twai_start();
-    }
-}
-
-// ==========================================
-// DTC & OBD PROCESSING
-// ==========================================
-
-void processDTCs(const uint8_t* dtcBuffer, uint8_t numCodes, uint16_t bufferLen) {
-    bool faultMatched = false;
-
-    for (int i = 0; i < numCodes; i++) {
-        if ((i * 2) + 1 >= bufferLen) {
-            Serial.println("[WARN] DTC buffer overflow prevented.");
-            break; 
-        }
-
-        uint8_t b1 = dtcBuffer[i * 2];
-        uint8_t b2 = dtcBuffer[(i * 2) + 1];
-        if (b1 == 0 && b2 == 0) continue;
-
-        char typeChar = "PCBU"[(b1 >> 6) & 0x03];
-        uint16_t code = ((b1 & 0x3F) << 8) | b2;
-
-        if (typeChar == 'P' && ((code >= 0x0130 && code <= 0x0167) || 
-                               (code >= 0x0420 && code <= 0x0439) ||
-                               (code >= 0x0470 && code <= 0x0480))) {
-            faultMatched = true;
-            logClearedDTC(typeChar, code);
-        }
-    }
-
-    if (faultMatched && !clearRequested && (millis() - lastClearTime >= CLEAR_COOLDOWN)) {
-        clearRequested = true;
-    }
-}
-
-void parseOBDResponse(const twai_message_t &msg) {
-    uint8_t pciType = (msg.data[0] & 0xF0) >> 4;
-
-    if (pciType == 0x0) {
-        uint8_t mode = msg.data[1];
-        if (mode == 0x41) {
-            uint8_t pid = msg.data[2];
-            
-            if (liveTelemetryMode) {
-                if ((telemetryStep == 0 && pid == 0x0C) || (telemetryStep == 1 && pid == 0x05) ||
-                    (telemetryStep == 2 && pid == 0x11) || (telemetryStep == 3 && pid == 0x0F) ||
-                    (telemetryStep == 4 && pid == 0x42)) {
-                    telemetryStep = (telemetryStep + 1) % 5;
-                    telemetryPending = false; 
-                }
-            }
-
-            if (pid == 0x0C) { // RPM
-                liveRPM = ((msg.data[3] << 8) | msg.data[4]) / 4;
-                if (clearRequested && liveRPM == 0) executeClear();
-            }
-            else if (pid == 0x05) liveTempC = msg.data[3] - 40; 
-            else if (pid == 0x11) liveTPS = (msg.data[3] * 100) / 255;
-            else if (pid == 0x0F) liveIAT = msg.data[3] - 40;
-            else if (pid == 0x42) { 
-                liveVoltage = ((msg.data[3] << 8) | msg.data[4]) / 1000.0;
-                
-                if (liveRPM > 800 && liveVoltage < VOLTAGE_MIN_THRESHOLD && 
-                    millis() - lastVoltageAlertTime >= VOLTAGE_ALERT_COOLDOWN) {
-                    lastVoltageAlertTime = millis();
-                    char alert[64];
-                    snprintf(alert, sizeof(alert), "⚠️ Low Voltage! %.1fV", liveVoltage);
-                    bleSendLine(alert);
-                }
-                
-                if (liveTelemetryMode) {
-                    telemetryUpdated = true; 
-                }
-            }
-            return;
-        }
-        if (mode == 0x43 || mode == 0x47) {
-            uint8_t dataLen = msg.data[0] & 0x0F;
-            if (dataLen >= 3) {
-                uint8_t numCodes = msg.data[2];
-                processDTCs(&msg.data[3], numCodes, 5); 
-            }
-        }
-    }
-    else if (pciType == 0x1) { // First Frame
-        uint8_t mode = msg.data[2];
-        if (mode == 0x43 || mode == 0x47) {
-            rxTotalLength = ((msg.data[0] & 0x0F) << 8) | msg.data[1];
-
-            if (rxTotalLength > RX_BUFFER_SIZE) {
-                sendFlowControl(true); // Send Abort Frame
-                return;
-            }
-
-            rxIndex = 0;
-            for (int i = 2; i < 8; i++) rxBuffer[rxIndex++] = msg.data[i];
-
-            isReceivingMultiFrame = true;
-            expectedSeqNum = 1;
-            multiFrameTimeout = millis();
-            sendFlowControl(false);
-        }
-    }
-    else if (pciType == 0x2) { // Consecutive Frame
-        if (!isReceivingMultiFrame) return;
-
-        uint8_t seqNum = msg.data[0] & 0x0F;
-        if (seqNum != expectedSeqNum) {
-            isReceivingMultiFrame = false;
-            return;
-        }
-
-        for (int i = 1; i < 8; i++) {
-            if (rxIndex < rxTotalLength) rxBuffer[rxIndex++] = msg.data[i];
-        }
-
-        expectedSeqNum = (expectedSeqNum + 1) & 0x0F;
-        multiFrameTimeout = millis();
-
-        if (rxIndex >= rxTotalLength) {
-            isReceivingMultiFrame = false;
-            processDTCs(&rxBuffer[2], rxBuffer[1], rxTotalLength - 2); 
-        }
-    }
-}
-
-// ==========================================
-// SETUP & INITIALIZATION
-// ==========================================
+// =============================================================================
+// SETUP
+// =============================================================================
 void setup() {
+    // Initialize USB CDC Serial
     Serial.begin(115200);
-    delay(1000);
 
-    // 1. Initialize FreeRTOS Queue and BLE Task
-    bleMsgQueue = xQueueCreate(BLE_MSG_QUEUE_LEN, BLE_MSG_MAX_LEN);
-    xTaskCreatePinnedToCore(bleTxTask, "BLE_TX_Task", 4096, NULL, 1, NULL, 0);
+    // Initialize Onboard LED
+    pinMode(ONBOARD_LED_PIN, OUTPUT);
+    digitalWrite(ONBOARD_LED_PIN, LED_ACTIVE_LOW ? HIGH : LOW); // OFF
 
-    // 2. Initialize NVS (Load individually)
-    preferences.begin("obd_data", false);
-    currentBootCount = preferences.getUInt("boot_cnt", 0) + 1;
-    preferences.putUInt("boot_cnt", currentBootCount);
-    
-    for(int i = 0; i < MAX_HISTORY; i++) {
-        char key[10];
-        snprintf(key, sizeof(key), "dtc_%d", i);
-        preferences.getBytes(key, &dtcHistory[i], sizeof(DTCRecord));
+    // Wait briefly for native USB CDC connection (up to 2.5s)
+    unsigned long startWait = millis();
+    while (!Serial && (millis() - startWait < 2500)) {
+        delay(10);
     }
-    historyIndex = preferences.getUChar("hist_idx", 0);
+    delay(200);
 
-    // 3. Initialize BLE
-    BLEDevice::setMTU(517); 
-    BLEDevice::init("MT09_OBD_BLE");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
+    printBanner();
 
-    BLEService *pService = pServer->createService(SERVICE_UUID);
-    pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
-    pTxCharacteristic->addDescriptor(new BLE2902());
+    // Start TWAI in safe LISTEN-ONLY mode at 500 kbps
+    if (initTWAI(currentBaud, listenOnlyMode)) {
+        Serial.printf("[INIT] CAN Controller initialized successfully on TX: GPIO %d, RX: GPIO %d\n", CAN_TX_PIN, CAN_RX_PIN);
+        Serial.printf("[INIT] Speed: %s | Mode: %s\n", BAUD_NAMES[currentBaud], listenOnlyMode ? "LISTEN-ONLY (Safe Passive)" : "NORMAL (Active ACK)");
+        Serial.println("[INIT] Listening for traffic... Press '?' or 'h' for menu.\n");
+    } else {
+        Serial.println("[ERROR] Failed to start CAN Controller! Check pins and wiring.");
+    }
+}
 
-    BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
-    pRxCharacteristic->setCallbacks(new MyRxCallbacks());
+// =============================================================================
+// MAIN LOOP
+// =============================================================================
+void loop() {
+    // 1. Process incoming commands from USB Serial
+    if (Serial.available()) {
+        processSerialInput();
+    }
 
-    pService->start();
-    pServer->getAdvertising()->start();
+    // 2. Receive CAN messages from TWAI hardware
+    if (twaiRunning) {
+        twai_message_t rxMsg;
+        // Non-blocking read (0 timeout)
+        while (twai_receive(&rxMsg, 0) == ESP_OK) {
+            handleFrame(rxMsg);
+        }
 
-    // 4. Initialize CAN/TWAI Driver with Hardware Filtering
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-    g_config.rx_queue_len = 50; 
-    g_config.tx_queue_len = 10;
-    g_config.alerts_enabled = TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED;
+        // Check for alerts / errors
+        uint32_t alertsTriggered = 0;
+        if (twai_read_alerts(&alertsTriggered, 0) == ESP_OK) {
+            if (alertsTriggered & TWAI_ALERT_BUS_ERROR) {
+                busErrorCount++;
+            }
+            if (alertsTriggered & TWAI_ALERT_RX_QUEUE_FULL) {
+                rxOverrunCount++;
+            }
+            if (alertsTriggered & TWAI_ALERT_BUS_OFF) {
+                if (currentOutputMode == OUTPUT_HUMAN) {
+                    Serial.println("\n[ALERT] TWAI Bus-Off detected! Initiating recovery...");
+                }
+                twai_initiate_recovery();
+            }
+            if (alertsTriggered & TWAI_ALERT_BUS_RECOVERED) {
+                if (currentOutputMode == OUTPUT_HUMAN) {
+                    Serial.println("\n[ALERT] TWAI Bus Recovered!");
+                }
+                twai_start();
+            }
+        }
+    }
 
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    // 3. Update FPS counter every second
+    unsigned long now = millis();
+    if (now - lastFpsCalcMs >= 1000) {
+        currentFps = framesLastSecond;
+        framesLastSecond = 0;
+        lastFpsCalcMs = now;
+    }
 
-    twai_filter_config_t f_config = {
-        .acceptance_code = (uint32_t)(0x7E8U << 21), 
-        .acceptance_mask = (uint32_t)~(0x007U << 21), 
-        .single_filter = true
-    };
+    // 4. Handle Non-blocking Activity LED Turn-off
+    if (ledTurnOffMs > 0 && now >= ledTurnOffMs) {
+        digitalWrite(ONBOARD_LED_PIN, LED_ACTIVE_LOW ? HIGH : LOW); // OFF
+        ledTurnOffMs = 0;
+    }
+}
 
-    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK || twai_start() != ESP_OK) {
-        Serial.println("[CAN] Failed to start TWAI driver!");
+// =============================================================================
+// TWAI CONTROLLER MANAGEMENT
+// =============================================================================
+bool initTWAI(CanBaudRate baud, bool listenOnly) {
+    if (twaiRunning) {
+        stopTWAI();
+    }
+
+    // 1. General Configuration
+    twai_general_config_t g_config;
+    if (listenOnly) {
+        g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+    } else {
+        g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+    }
+    g_config.rx_queue_len = 64; // Large RX buffer to prevent drops during bursts
+    g_config.alerts_enabled = TWAI_ALERT_BUS_ERROR | TWAI_ALERT_RX_QUEUE_FULL | 
+                             TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED;
+
+    // 2. Timing Configuration
+    twai_timing_config_t t_config;
+    switch (baud) {
+        case BAUD_500K:
+            t_config = TWAI_TIMING_CONFIG_500KBITS();
+            break;
+        case BAUD_250K:
+            t_config = TWAI_TIMING_CONFIG_250KBITS();
+            break;
+        case BAUD_1M:
+            t_config = TWAI_TIMING_CONFIG_1MBITS();
+            break;
+        case BAUD_125K:
+            t_config = TWAI_TIMING_CONFIG_125KBITS();
+            break;
+        default:
+            t_config = TWAI_TIMING_CONFIG_500KBITS();
+            break;
+    }
+
+    // 3. Filter Configuration (Accept all frames)
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    // Install Driver
+    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err != ESP_OK) {
+        return false;
+    }
+    twaiInstalled = true;
+
+    // Start Driver
+    err = twai_start();
+    if (err != ESP_OK) {
+        twai_driver_uninstall();
+        twaiInstalled = false;
+        return false;
+    }
+    twaiRunning = true;
+    return true;
+}
+
+void stopTWAI() {
+    if (twaiRunning) {
+        twai_stop();
+        twaiRunning = false;
+    }
+    if (twaiInstalled) {
+        twai_driver_uninstall();
+        twaiInstalled = false;
+    }
+}
+
+// =============================================================================
+// FRAME PROCESSING & OUTPUT
+// =============================================================================
+void handleFrame(const twai_message_t &rxMsg) {
+    totalFramesRx++;
+    framesLastSecond++;
+    triggerLedActivity();
+
+    uint32_t id = rxMsg.identifier;
+    bool isExt = rxMsg.flags & TWAI_MSG_FLAG_EXTD;
+    bool isRtr = rxMsg.flags & TWAI_MSG_FLAG_RTR;
+    uint8_t dlc = rxMsg.data_length_code;
+    unsigned long now = millis();
+
+    // Check Filter if active
+    if (filterActive && id != filterId) {
         return;
     }
+
+    // 1. Update Unique ID Stats
+    uint32_t intervalMs = 0;
+    int foundIdx = -1;
+    for (uint16_t i = 0; i < uniqueIdCount; i++) {
+        if (uniqueIds[i].id == id && uniqueIds[i].isExtended == isExt) {
+            foundIdx = i;
+            break;
+        }
+    }
+
+    if (foundIdx >= 0) {
+        uniqueIds[foundIdx].count++;
+        intervalMs = now - uniqueIds[foundIdx].lastSeenMs;
+        uniqueIds[foundIdx].lastIntervalMs = intervalMs;
+        uniqueIds[foundIdx].lastSeenMs = now;
+        uniqueIds[foundIdx].dlc = dlc;
+        if (!isRtr) {
+            memcpy(uniqueIds[foundIdx].lastData, rxMsg.data, (dlc > 8) ? 8 : dlc);
+        }
+    } else if (uniqueIdCount < MAX_UNIQUE_IDS) {
+        uniqueIds[uniqueIdCount].id = id;
+        uniqueIds[uniqueIdCount].isExtended = isExt;
+        uniqueIds[uniqueIdCount].count = 1;
+        uniqueIds[uniqueIdCount].lastSeenMs = now;
+        uniqueIds[uniqueIdCount].lastIntervalMs = 0;
+        uniqueIds[uniqueIdCount].dlc = dlc;
+        if (!isRtr) {
+            memcpy(uniqueIds[uniqueIdCount].lastData, rxMsg.data, (dlc > 8) ? 8 : dlc);
+        }
+        uniqueIdCount++;
+    }
+
+    if (streamPaused) {
+        return;
+    }
+
+    // 2. Output Formatting
+    if (currentOutputMode == OUTPUT_HUMAN) {
+        // Human Readable Format:
+        // [   12.345s] ID: 0x7E8  [STD] DLC: 8  DATA: 02 01 00 00 00 00 00 00 | ........ | (Δ 20ms | 50.0 Hz)
+        float sec = now / 1000.0;
+        Serial.printf("[%8.3fs] ID: 0x", sec);
+        if (isExt) {
+            Serial.printf("%08X [EXT]", id);
+        } else {
+            Serial.printf("%03X      [STD]", id);
+        }
+
+        if (isRtr) {
+            Serial.printf(" DLC: %d [RTR FRAME]\n", dlc);
+            return;
+        }
+
+        Serial.printf(" DLC: %d  DATA: ", dlc);
+
+        // Hex data bytes
+        for (int i = 0; i < 8; i++) {
+            if (i < dlc) {
+                Serial.printf("%02X ", rxMsg.data[i]);
+            } else {
+                Serial.print("   ");
+            }
+        }
+
+        // ASCII representation
+        Serial.print("| ");
+        for (int i = 0; i < dlc; i++) {
+            char c = (char)rxMsg.data[i];
+            if (c >= 32 && c <= 126) {
+                Serial.print(c);
+            } else {
+                Serial.print('.');
+            }
+        }
+        for (int i = dlc; i < 8; i++) {
+            Serial.print(' ');
+        }
+        Serial.print(" |");
+
+        // Delta time / frequency
+        if (intervalMs > 0) {
+            float hz = 1000.0f / (float)intervalMs;
+            Serial.printf(" (Δ %ums | %4.1fHz)", intervalMs, hz);
+        }
+        Serial.println();
+
+    } else if (currentOutputMode == OUTPUT_SLCAN) {
+        // Lawicel SLCAN format for SavvyCAN / Wireshark:
+        // Standard frame: t<id 3 hex><dlc 1 hex><data hex>\r
+        // Extended frame: T<id 8 hex><dlc 1 hex><data hex>\r
+        // Remote standard: r<id 3 hex><dlc 1 hex>\r
+        // Remote extended: R<id 8 hex><dlc 1 hex>\r
+        if (isRtr) {
+            if (isExt) {
+                Serial.printf("R%08X%1X\r", id, dlc);
+            } else {
+                Serial.printf("r%03X%1X\r", id, dlc);
+            }
+        } else {
+            if (isExt) {
+                Serial.printf("T%08X%1X", id, dlc);
+            } else {
+                Serial.printf("t%03X%1X", id, dlc);
+            }
+            for (int i = 0; i < dlc && i < 8; i++) {
+                Serial.printf("%02X", rxMsg.data[i]);
+            }
+            Serial.print("\r");
+        }
+    }
 }
 
-// ==========================================
-// MAIN LOOP
-// ==========================================
-void loop() {
-    if (requestOTA.exchange(false)) {
-        if (liveRPM > 0 && liveTelemetryMode) bleSendLine("[ERROR] Engine is running!");
-        else enterOTAMode();
-    }
-    
-    if (otaMode) {
-        ArduinoOTA.handle(); 
-        delay(10);
-        return; 
-    }
+void triggerLedActivity() {
+    digitalWrite(ONBOARD_LED_PIN, LED_ACTIVE_LOW ? LOW : HIGH); // Turn ON
+    ledTurnOffMs = millis() + 15; // Stay on for 15ms
+}
 
-    if (requestTelemetryToggleAlert.exchange(false)) {
-        telemetryPending = false;            
-        telemetryStep = 0;
-        bleSendLine(liveTelemetryMode ? "[SYSTEM] Live Telemetry Started" : "[SYSTEM] Live Telemetry Stopped");
-    }
+// =============================================================================
+// SERIAL INTERACTIVE CLI
+// =============================================================================
+void processSerialInput() {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() == 0) return;
 
-    if (requestPrintHistory.exchange(false)) printDTCHistory();
-    if (requestCSVExport.exchange(false)) exportHistoryCSV();
+    char cmd = input.charAt(0);
 
-    checkBusHealth();
+    switch (cmd) {
+        case '?':
+        case 'h':
+        case 'H':
+            printHelp();
+            break;
 
-    if (telemetryUpdated.exchange(false) && liveTelemetryMode) {
-        char tBuffer[128]; 
-        snprintf(tBuffer, sizeof(tBuffer), "RPM:%04d | Coolant:%dC | IAT:%dC | TPS:%02d%% | Batt:%.1fV", 
-                 liveRPM, liveTempC, liveIAT, liveTPS, liveVoltage);
-        bleSendLine(tBuffer);
-    }
+        case 'm':
+        case 'M':
+            if (currentOutputMode == OUTPUT_HUMAN) {
+                currentOutputMode = OUTPUT_SLCAN;
+                Serial.println("\n[MODE] Switched to SLCAN / Lawicel protocol (for SavvyCAN / Wireshark).");
+            } else {
+                currentOutputMode = OUTPUT_HUMAN;
+                Serial.println("\n[MODE] Switched to Human-Readable Monitor.");
+            }
+            break;
 
-    if (isReceivingMultiFrame && (millis() - multiFrameTimeout > MULTI_FRAME_TIMEOUT_MS)) {
-        isReceivingMultiFrame = false;
-        rxIndex = 0;
-        rxTotalLength = 0;
-    }
+        case 'l':
+        case 'L':
+            listenOnlyMode = !listenOnlyMode;
+            Serial.printf("\n[CONFIG] Switching to %s mode...\n", listenOnlyMode ? "LISTEN-ONLY (Safe Passive)" : "NORMAL (Active ACK)");
+            if (initTWAI(currentBaud, listenOnlyMode)) {
+                Serial.println("[CONFIG] Mode applied successfully.");
+            } else {
+                Serial.println("[ERROR] Failed to switch mode!");
+            }
+            break;
 
-    twai_message_t rx_msg;
-    uint8_t msgCount = 0; 
-    while (twai_receive(&rx_msg, pdMS_TO_TICKS(1)) == ESP_OK && msgCount < 15) {
-        lastCanRxTime = millis(); 
-        parseOBDResponse(rx_msg); 
-        msgCount++;
-    }
-
-    if (millis() - lastCanRxTime > 3000) {
-        if (liveRPM > 0) liveRPM = 0; 
-        if (clearRequested) clearRequested = false; 
-    }
-
-    if (nvsWritePending && liveRPM == 0) {
-        commitDTCHistory();
-    }
-
-    if (!deviceConnected && oldDeviceConnected) {
-        delay(500);
-        pServer->startAdvertising();
-        oldDeviceConnected = deviceConnected;
-    }
-    if (deviceConnected && !oldDeviceConnected) {
-        oldDeviceConnected = deviceConnected;
-    }
-
-    if (liveTelemetryMode) {
-        if (!telemetryPending || (millis() - telemetrySentTime > 250)) {
-            telemetryPending = true;
-            telemetrySentTime = millis();
-            if (telemetryStep == 0) sendOBDRequest(0x01, 0x0C);      
-            else if (telemetryStep == 1) sendOBDRequest(0x01, 0x05); 
-            else if (telemetryStep == 2) sendOBDRequest(0x01, 0x11); 
-            else if (telemetryStep == 3) sendOBDRequest(0x01, 0x0F); 
-            else if (telemetryStep == 4) sendOBDRequest(0x01, 0x42); 
+        case 'b':
+        case 'B': {
+            currentBaud = (CanBaudRate)((currentBaud + 1) % BAUD_COUNT);
+            Serial.printf("\n[CONFIG] Changing Baud Rate to: %s\n", BAUD_NAMES[currentBaud]);
+            if (initTWAI(currentBaud, listenOnlyMode)) {
+                Serial.println("[CONFIG] Baud rate applied successfully.");
+            } else {
+                Serial.println("[ERROR] Failed to apply baud rate!");
+            }
+            break;
         }
-    } 
-    else if (clearRequested) {
-        if (millis() - lastRpmRequestTime >= RPM_POLL_INTERVAL) {
-            lastRpmRequestTime = millis();
-            sendOBDRequest(0x01, 0x0C); 
+
+        case 'u':
+        case 'U':
+            printUniqueIdsTable();
+            break;
+
+        case 's':
+        case 'S':
+            printStats();
+            break;
+
+        case 'p':
+        case 'P':
+            streamPaused = !streamPaused;
+            Serial.printf("\n[STREAM] %s\n", streamPaused ? "PAUSED (Frame stats still accumulating)" : "RESUMED");
+            break;
+
+        case 'c':
+        case 'C':
+            uniqueIdCount = 0;
+            totalFramesRx = 0;
+            busErrorCount = 0;
+            rxOverrunCount = 0;
+            filterActive = false;
+            filterId = 0;
+            Serial.print("\033[2J\033[H"); // ANSI Clear Screen
+            Serial.println("\n[RESET] Cleared all counters, unique IDs, and filters.");
+            break;
+
+        case 'f':
+        case 'F': {
+            // Filter command: "f 7E8" or "f" to clear
+            if (input.length() > 2) {
+                String hexStr = input.substring(1);
+                hexStr.trim();
+                uint32_t parsedId = strtoul(hexStr.c_str(), NULL, 16);
+                if (parsedId > 0) {
+                    filterId = parsedId;
+                    filterActive = true;
+                    Serial.printf("\n[FILTER] Now focusing only on CAN ID: 0x%X\n", filterId);
+                } else {
+                    filterActive = false;
+                    Serial.println("\n[FILTER] Filter cleared. Showing all IDs.");
+                }
+            } else {
+                filterActive = false;
+                Serial.println("\n[FILTER] Filter cleared. Showing all IDs.");
+            }
+            break;
         }
-    } 
-    else {
-        if (millis() - lastPollTime >= POLL_INTERVAL) {
-            lastPollTime = millis();
-            sendOBDRequest(0x03); 
-        }
+
+        default:
+            Serial.printf("[CLI] Unknown command '%c'. Type '?' or 'h' for help.\n", cmd);
+            break;
+    }
+}
+
+// =============================================================================
+// CLI REPORTS & MENUS
+// =============================================================================
+void printBanner() {
+    Serial.println("\n=================================================================");
+    Serial.println("  🏍️  YAMAHA MT-09 SP EURO 5+ CAN BUS SNIFFER");
+    Serial.println("  Hardware: ESP32-C3 Super Mini Plus | TWAI CAN Controller");
+    Serial.println("=================================================================");
+}
+
+void printHelp() {
+    Serial.println("\n-----------------------------------------------------------------");
+    Serial.println("                    INTERACTIVE SERIAL COMMANDS                  ");
+    Serial.println("-----------------------------------------------------------------");
+    Serial.println("  ? or h       : Show this help menu");
+    Serial.println("  m            : Toggle Output Mode (Human-Readable vs SLCAN for SavvyCAN)");
+    Serial.println("  l            : Toggle Mode (Listen-Only [Passive] vs Normal [Active ACK])");
+    Serial.println("  b            : Cycle Baud Rate (500k -> 250k -> 1M -> 125k)");
+    Serial.println("  u            : Display Discovered Unique CAN IDs Table");
+    Serial.println("  s            : Display CAN Bus Health & Diagnostic Statistics");
+    Serial.println("  p            : Pause / Resume live frame streaming");
+    Serial.println("  f <hex_id>   : Filter by CAN ID (e.g. 'f 7E8' or 'f' to clear)");
+    Serial.println("  c            : Clear screen, counters, and unique ID table");
+    Serial.println("-----------------------------------------------------------------\n");
+}
+
+void printStats() {
+    twai_status_info_t status;
+    twai_get_status_info(&status);
+
+    const char* stateStr = "UNKNOWN";
+    switch (status.state) {
+        case TWAI_STATE_STOPPED:    stateStr = "STOPPED"; break;
+        case TWAI_STATE_RUNNING:    stateStr = "RUNNING (Active)"; break;
+        case TWAI_STATE_BUS_OFF:    stateStr = "BUS-OFF (Check physical wiring / baud)"; break;
+        case TWAI_STATE_RECOVERING: stateStr = "RECOVERING"; break;
     }
 
-    delay(1); 
+    Serial.println("\n=================================================================");
+    Serial.println("                     CAN BUS DIAGNOSTICS & HEALTH                ");
+    Serial.println("=================================================================");
+    Serial.printf("  Hardware State      : %s\n", stateStr);
+    Serial.printf("  Operating Mode      : %s\n", listenOnlyMode ? "LISTEN-ONLY (Safe Passive)" : "NORMAL (Active ACK)");
+    Serial.printf("  Baud Rate           : %s\n", BAUD_NAMES[currentBaud]);
+    Serial.printf("  CAN Pins            : TX: GPIO %d | RX: GPIO %d\n", CAN_TX_PIN, CAN_RX_PIN);
+    Serial.printf("  Total Frames Rx     : %u frames\n", totalFramesRx);
+    Serial.printf("  Current Bus Load    : %u frames/sec (FPS)\n", currentFps);
+    Serial.printf("  Unique IDs Seen     : %u / %d\n", uniqueIdCount, MAX_UNIQUE_IDS);
+    Serial.printf("  Bus Error Warnings  : %u\n", busErrorCount);
+    Serial.printf("  RX Queue Overruns   : %u\n", rxOverrunCount);
+    Serial.printf("  Hardware TEC / REC  : %u / %u (Transmit / Receive Error Counters)\n", status.tx_error_counter, status.rx_error_counter);
+    if (filterActive) {
+        Serial.printf("  Active ID Filter    : 0x%X\n", filterId);
+    } else {
+        Serial.println("  Active ID Filter    : NONE (All frames streamed)");
+    }
+    Serial.println("=================================================================\n");
+}
+
+void printUniqueIdsTable() {
+    Serial.println("\n============================================================================================");
+    Serial.println("                                DISCOVERED UNIQUE CAN IDs TABLE                             ");
+    Serial.println("============================================================================================");
+    Serial.println(" ID          Type  DLC   Count      Rate (Hz)   Interval   Last Data Payload (Hex)          ");
+    Serial.println("--------------------------------------------------------------------------------------------");
+
+    if (uniqueIdCount == 0) {
+        Serial.println("  (No CAN traffic received yet. Check bike ignition, transceiver wiring, and baud rate)");
+    } else {
+        for (uint16_t i = 0; i < uniqueIdCount; i++) {
+            if (uniqueIds[i].isExtended) {
+                Serial.printf(" 0x%08X  EXT   %d   %-9u", uniqueIds[i].id, uniqueIds[i].dlc, uniqueIds[i].count);
+            } else {
+                Serial.printf(" 0x%03X       STD   %d   %-9u", uniqueIds[i].id, uniqueIds[i].dlc, uniqueIds[i].count);
+            }
+
+            if (uniqueIds[i].lastIntervalMs > 0) {
+                float hz = 1000.0f / (float)uniqueIds[i].lastIntervalMs;
+                Serial.printf(" %5.1f Hz    %4u ms    ", hz, uniqueIds[i].lastIntervalMs);
+            } else {
+                Serial.print("   --- Hz     --- ms    ");
+            }
+
+            for (int b = 0; b < uniqueIds[i].dlc && b < 8; b++) {
+                Serial.printf("%02X ", uniqueIds[i].lastData[b]);
+            }
+            Serial.println();
+        }
+    }
+    Serial.println("--------------------------------------------------------------------------------------------");
+    Serial.printf(" Total Unique IDs: %u | Total Rx: %u frames | Speed: %s\n", uniqueIdCount, totalFramesRx, BAUD_NAMES[currentBaud]);
+    Serial.println("============================================================================================\n");
 }
