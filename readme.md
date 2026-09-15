@@ -8,7 +8,7 @@
 
 An autonomous, production-grade CAN bus diagnostic tool, real-time telemetry cockpit, and exhaust fault cleaner tailored for the **2021–2026+ Yamaha MT-09 / MT-09 SP (Euro 5 / Euro 5+ / CP3)** running on an ultra-compact **ESP32-C3 Super Mini Plus**.
 
-Designed to live permanently under the passenger seat, it eliminates exhaust servo motor Check Engine Lights (CEL), decodes Yamaha ECU diagnostic trouble codes in real-time, logs clear history to persistent NVS flash memory, and pairs instantly with your smartphone over Bluetooth Low Energy (BLE)—with zero battery drain when parked.
+Designed to live permanently under the passenger seat, it eliminates exhaust Check Engine Lights (CEL), decodes Yamaha ECU diagnostic trouble codes in real-time, logs clear history to persistent NVS flash memory, and pairs instantly with your smartphone over Bluetooth Low Energy (BLE)—with zero battery drain when parked.
 
 ---
 
@@ -16,7 +16,7 @@ Designed to live permanently under the passenger seat, it eliminates exhaust ser
 
 * 🛡️ **100% Autonomous Headless Auto-Clear**:
   * Operates completely silently in the background—**zero user interaction or phone connection required**.
-  * Automatically scans ECU for trouble codes 4 seconds after ignition key-ON and clears exhaust servo / O2 faults (e.g. `P0036`, `P0030`) caused by aftermarket exhausts (Akrapovič, Arrow, decat headers).
+  * Automatically scans ECU for trouble codes 4 seconds after ignition key-ON and clears exhaust / O2 faults (e.g. `P0036`, `P0030`) caused by aftermarket exhausts (Akrapovič, Arrow, decat headers).
   * Automatically detects engine shutdown and runs a background scan/clear cycle 3 seconds later.
 * 💾 **Persistent Flash NVS Clear Logger**:
   * Automatically records every clear event to ESP32 Flash memory (`Preferences` NVS).
@@ -32,8 +32,6 @@ Designed to live permanently under the passenger seat, it eliminates exhaust ser
   * Automatically enters deep sleep after 60 seconds of CAN silence and BLE disconnection.
   * Instant hardware wakeup via GPIO 3 (`CAN_RX`) on the first dominant start-of-frame bit when the ignition key is turned ON.
   * Safe for months of parking without draining the motorcycle battery.
-* 🖨️ **3D-Printable Weatherproof Subframe Enclosure**:
-  * Parametric OpenSCAD CAD source and ready-to-slice binary STLs with subframe zip-tie mounting tabs, cable strain relief collar, and LED viewing port.
 
 ---
 
@@ -100,7 +98,6 @@ Simply open [**https://tap202.github.io/Euro5Cleaner/**](https://tap202.github.i
 | `GPIO 21` | `TX` / `TXD` | TWAI / CAN Transmit |
 | `GPIO 3` | `RX` / `RXD` | TWAI / CAN Receive (RTC GPIO Wakeup Pin) |
 | `GPIO 8` | *(Onboard LED)* | Active-LOW CAN packet activity indicator |
-| `USB-C` | USB D+ / D- | Native CDC Serial Terminal (115200 baud) |
 
 ---
 
@@ -144,25 +141,6 @@ The ESP32-C3 consumes approximately **5–15 µA** in deep sleep, preventing mot
 
 ---
 
-## 📦 3D-Printable Weatherproof Enclosure
-
-The [`enclosure/`](enclosure/) directory provides a custom snap-fit case engineered to clamp securely to the MT-09 subframe:
-
-| File | Format | Description |
-| :--- | :--- | :--- |
-| [`mt09_can_case.scad`](enclosure/mt09_can_case.scad) | OpenSCAD | Fully parametric source model for custom tolerances and dimensions. |
-| [`mt09_case_base.stl`](enclosure/mt09_case_base.stl) | Binary STL | Base compartment with internal PCB cradle standoffs, cable strain relief collar, and dual subframe zip-tie wings. |
-| [`mt09_case_lid.stl`](enclosure/mt09_case_lid.stl) | Binary STL | Snap-fit top cover with embossed MT-09 SP branding and LED light-pipe inspection window. |
-
-### Recommended 3D Printing Parameters
-* **Filament:** PETG, ABS, or ASA (UV & heat resistant up to 80°C+ under motorcycle seats).
-* **Layer Height:** `0.20 mm`.
-* **Infill:** `30% – 40% Gyroid`.
-* **Perimeters:** `3 walls`.
-* **Supports:** None required (engineered with self-supporting 45° overhangs).
-
----
-
 ## 🚀 Quickstart & Installation
 
 ### 1. Build & Flash Firmware via PlatformIO
@@ -181,25 +159,6 @@ The [`enclosure/`](enclosure/) directory provides a custom snap-fit case enginee
    ```bash
    pio device monitor -b 115200
    ```
-
----
-
-### 2. Enable GitHub Pages (Host Web Cockpit in 30 Seconds)
-
-The Web BLE Cockpit (`index.html`) can be hosted directly from this repository for free with zero maintenance:
-
-1. Open your repository on GitHub: [**https://github.com/Tap202/Euro5Cleaner**](https://github.com/Tap202/Euro5Cleaner)
-2. Go to **Settings** $\to$ **Pages** (in the left navigation sidebar).
-3. Under **Build and deployment**:
-   * **Source:** Select `Deploy from a branch`
-   * **Branch:** Select `main`
-   * **Folder:** Select `/ (root)`
-   * Click **Save**.
-4. Within ~1 minute, GitHub will publish your live dashboard at:
-   ```
-   https://tap202.github.io/Euro5Cleaner/
-   ```
-5. Open that URL on iOS (via [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055)) or Android/PC (via Chrome) to control your MT-09 wirelessly!
 
 ---
 
