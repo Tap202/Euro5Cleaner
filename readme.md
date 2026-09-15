@@ -3,12 +3,12 @@
 [![PlatformIO CI Build](https://github.com/Tap202/Euro5Cleaner/actions/workflows/build.yml/badge.svg)](https://github.com/Tap202/Euro5Cleaner/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: ESP32-C3](https://img.shields.io/badge/Platform-ESP32--C3%20Super%20Mini-orange.svg)](https://www.espressif.com/en/products/socs/esp32-c3)
-[![CAN Speed: 500 kbps](https://img.shields.io/badge/CAN%20Bus-500%20kbps%20Euro%205%2B-green.svg)](#-hardware-setup--pinout)
+[![Web BLE Cockpit](https://img.shields.io/badge/Live%20Cockpit-GitHub%20Pages-00e5ff.svg)](https://tap202.github.io/Euro5Cleaner/)
 [![Power: Deep Sleep <15µA](https://img.shields.io/badge/Deep%20Sleep-%3C%2015%20%C2%B5A-brightgreen.svg)](#-ultra-low-power-deep-sleep--can-rx-wakeup)
 
 An autonomous, production-grade CAN bus diagnostic tool, real-time telemetry cockpit, and exhaust fault cleaner tailored for the **2021–2026+ Yamaha MT-09 / MT-09 SP (Euro 5 / Euro 5+ / CP3)** running on an ultra-compact **ESP32-C3 Super Mini Plus**.
 
-Designed to live permanently under the passenger seat, it eliminates exhaust servo motor Check Engine Lights (CEL), decodes high-frequency Yamaha 6-axis IMU lean angles, logs ride telemetry to CSV, and serves a modern, distraction-free wireless cockpit to your smartphone—with zero battery drain when parked.
+Designed to live permanently under the passenger seat, it eliminates exhaust servo motor Check Engine Lights (CEL), decodes Yamaha ECU diagnostic trouble codes in real-time, logs clear history to persistent NVS flash memory, and pairs instantly with your smartphone over Bluetooth Low Energy (BLE)—with zero battery drain when parked.
 
 ---
 
@@ -18,62 +18,71 @@ Designed to live permanently under the passenger seat, it eliminates exhaust ser
   * Operates completely silently in the background—**zero user interaction or phone connection required**.
   * Automatically scans ECU for trouble codes 4 seconds after ignition key-ON and clears exhaust servo / O2 faults (e.g. `P0036`, `P0030`) caused by aftermarket exhausts (Akrapovič, Arrow, decat headers).
   * Automatically detects engine shutdown and runs a background scan/clear cycle 3 seconds later.
+* 💾 **Persistent Flash NVS Clear Logger**:
+  * Automatically records every clear event to ESP32 Flash memory (`Preferences` NVS).
+  * Logs boot count, uptime seconds, trigger source (`BOOT_AUTO`, `POST_RIDE`, `BLE_MANUAL`), codes cleared, and execution status.
+  * Survives battery disconnections and reboots; retrievable at any time over BLE or Serial CLI.
 * 🔒 **Hardware-Enforced Engine-OFF Safety Interlock**:
   * Mode 04 clear frames are strictly locked out whenever the engine is running or RPM > 0.
-* 🏍️ **MotoGP-Style Real-Time Lean Angle**:
-  * Reverse-engineered high-speed (1,000 Hz) broadcast from the factory Yamaha 6-axis IMU (CAN ID `0x27C`).
-  * Live degrees display (`◀ 38.5° L` / `42.1° R ▶`), animated tilting motorcycle avatar, and persistent **Max Left / Max Right** lean memory.
-* 📊 **Ride Telemetry Logger & 1-Click CSV Export**:
-  * High-frequency sampling of `RPM`, `Speed (MPH & KM/H)`, `Gear`, `Throttle (TPS %)`, `Coolant Temp (°C)`, `IAT (°C)`, `Battery Voltage (V)`, and `Lean Angle (°)`.
-  * Instant 1-click browser download of `MT09_Ride_Data_YYYY-MM-DD.csv` for analysis in Excel or trackday data software.
+* 📱 **Bluetooth Low Energy (BLE 5.0) GATT Interface**:
+  * Connects directly to smartphones with zero Wi-Fi network switching or internet interruption.
+  * Hosted live on **GitHub Pages** (no file download needed): [**https://tap202.github.io/Euro5Cleaner/**](https://tap202.github.io/Euro5Cleaner/).
+  * Works on **iOS (iPhone/iPad)** via **Bluefy** or **nRF Connect**, and on **Android/PC/Mac** via **Google Chrome** or **Edge**.
 * 🌙 **Ultra-Low Power Deep Sleep (< 15 µA)**:
-  * Automatically enters deep sleep after 60 seconds of CAN silence.
+  * Automatically enters deep sleep after 60 seconds of CAN silence and BLE disconnection.
   * Instant hardware wakeup via GPIO 3 (`CAN_RX`) on the first dominant start-of-frame bit when the ignition key is turned ON.
   * Safe for months of parking without draining the motorcycle battery.
-* 📱 **Modern Wireless Cockpit (Standalone Wi-Fi AP & PWA)**:
-  * Hosts open Wi-Fi network `MT09-SP-CAN` with instant Captive Portal at `http://192.168.4.1` (or `http://mt09.local`).
-  * Hero tachometer (0–11.5k RPM), calculated transmission gear (`[N]`, `[1]`–`[6]`), 0–60 MPH launch timer, shift light strobing at 9,800+ RPM, and 1-tap high-contrast **Sunlight Mode**.
-* 📶 **Seatless Wireless Web OTA Updates**:
-  * Dual 1.9MB OTA bank partition scheme (`min_spiffs.csv`). Flash new firmware over Wi-Fi at `http://192.168.4.1/update` without removing seat or tools!
 * 🖨️ **3D-Printable Weatherproof Subframe Enclosure**:
   * Parametric OpenSCAD CAD source and ready-to-slice binary STLs with subframe zip-tie mounting tabs, cable strain relief collar, and LED viewing port.
 
 ---
 
-## 📱 Mobile Web Dashboard
+## 📱 Mobile BLE Cockpit & iOS Access Guide
 
-Connect your phone to the bike's Wi-Fi network to access the cockpit without installing any third-party app:
+### 🌐 Hosted Online via GitHub Pages (Zero Downloads Required)
 
-1. Connect to Wi-Fi: **`MT09-SP-CAN`** (Open, no password).
-2. Navigate to **`http://192.168.4.1`** (or **`http://mt09.local`**).
-3. *(Optional)* Tap **Share $\to$ Add to Home Screen** in Safari / Chrome for a frameless native full-screen app experience.
+You do **not** need to manually download or transfer HTML files to your phone. The BLE Cockpit is hosted for free on GitHub Pages over secure HTTPS:
 
-```
-+-------------------------------------------------------------+
-|  [Wi-Fi Active]      YAMAHA MT-09 SP       [☀️ Sunlight]    |
-|-------------------------------------------------------------|
-|  [🛡️ Background Auto-Clear: ARMED]              [4 Cleared] |
-|  [Engine: RUNNING]       [ECU: CLEAN]       [Battery: 14.2V]|
-|-------------------------------------------------------------|
-|      [GEAR: 3]                       [ 64 MPH ]             |
-|   ||||||||||||||||||||||||||||||||||||||......  8,450 RPM   |
-|   0        3K         6K         9K       11.5K [SHIFT 9.8K]|
-|-------------------------------------------------------------|
-|                 🏍️ REAL-TIME LEAN ANGLE                     |
-|      Max Left: 44.2°      [ 38.5° R ▶ ]     Max Right: 47.1°|
-|     [-60° ------------●----------------------- +60°]        |
-|-------------------------------------------------------------|
-| [TPS: 42%]  [Coolant: 84°C]  [0-60: 3.41s]  [Stator: 14.2V] |
-|-------------------------------------------------------------|
-| 📊 RIDE TELEMETRY LOGGER: 1,840 samples | 03:45             |
-| [ ■ Stop Recording ]                  [ 💾 Export CSV ]     |
-|-------------------------------------------------------------|
-| [🔍 Manual Scan Codes]            [🧹 Clear Codes (Eng-OFF)]|
-+-------------------------------------------------------------+
-```
+👉 [**https://tap202.github.io/Euro5Cleaner/**](https://tap202.github.io/Euro5Cleaner/)
 
-> [!TIP]
-> **Standalone Desktop Simulator:** You can preview and test the dashboard on your computer without an ESP32 plugged in! Simply double-click [`dashboard_wifi.html`](file:///c:/EU5/Euro5Cleaner/dashboard_wifi.html) in your browser. The built-in simulator dynamically animates rev sweeps, cornering lean, shift lights, and CSV export.
+---
+
+### 🍏 Accessing on iOS (iPhone / iPad)
+
+> [!IMPORTANT]
+> **Why Safari doesn't connect:** Apple's WebKit engine in standard Safari and Chrome for iOS intentionally does **not** support the Web Bluetooth API (`navigator.bluetooth`). 
+
+You have two simple, free ways to use it on iOS:
+
+#### Option A: Free Web BLE Browser (Recommended — Full Visual Dashboard)
+1. Install **[Bluefy – Web BLE Browser](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055)** (Free on the iOS App Store).
+2. Open Bluefy and navigate to:
+   ```
+   https://tap202.github.io/Euro5Cleaner/
+   ```
+3. Tap **Connect BLE** $\to$ select **`MT09-Cleaner`**.
+4. *(Optional)* Tap the **Share / Action** icon in Bluefy and choose **"Add to Home Screen"** to turn it into a full-screen, standalone app on your iPhone!
+
+#### Option B: Generic BLE GATT App (nRF Connect)
+1. Install **[nRF Connect for Mobile](https://apps.apple.com/app/nrf-connect-for-mobile/id1054362403)** (Free on the iOS App Store).
+2. Scan and connect to **`MT09-Cleaner`** (Service UUID `000018F0-0000-1000-8000-00805F9B34FB`).
+3. Tap the Download / Notify icon on:
+   * **`18F1` (Status)**: Live JSON string with ECU state and engine status.
+   * **`18F2` (DTCs)**: Live trouble codes and descriptions.
+   * **`18F4` (Logs)**: NVS flash clear history entries.
+4. Write UTF-8 text commands to **`18F3` (Command)**:
+   * `SCAN` : Query ECU for confirmed & pending trouble codes.
+   * `CLEAR`: Safely clear codes and reset Check Engine Light.
+   * `LOGS` : Refresh stored NVS history.
+   * `ERASE_LOGS`: Wipe flash history.
+
+---
+
+### 🤖 Accessing on Android, Windows, Mac & Linux
+
+Simply open [**https://tap202.github.io/Euro5Cleaner/**](https://tap202.github.io/Euro5Cleaner/) directly in **Google Chrome** or **Microsoft Edge**:
+1. Click **Connect BLE** $\to$ select **`MT09-Cleaner`** in the pairing dialog.
+2. The cockpit will automatically subscribe to notifications and display real-time statuses and logs.
 
 ---
 
@@ -125,7 +134,7 @@ Located underneath the passenger seat of 2021+ Yamaha MT-09 / MT-09 SP models:
 
 The ESP32-C3 consumes approximately **5–15 µA** in deep sleep, preventing motorcycle battery drain during long storage:
 
-1. **Auto-Sleep:** If no CAN traffic is detected for 60 seconds (ignition key switched OFF) and no Wi-Fi clients are connected, the firmware stops TWAI and Wi-Fi and enters Deep Sleep:
+1. **Auto-Sleep:** If no CAN traffic is detected for 60 seconds (ignition key switched OFF) and no BLE clients are connected, the firmware stops TWAI and BLE and enters Deep Sleep:
    ```cpp
    esp_deep_sleep_enable_gpio_wakeup(1ULL << CAN_RX_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
    esp_deep_sleep_start();
@@ -156,7 +165,7 @@ The [`enclosure/`](enclosure/) directory provides a custom snap-fit case enginee
 
 ## 🚀 Quickstart & Installation
 
-### Option 1: Build & Flash via PlatformIO (Recommended)
+### 1. Build & Flash Firmware via PlatformIO
 
 1. Clone repository:
    ```bash
@@ -173,17 +182,24 @@ The [`enclosure/`](enclosure/) directory provides a custom snap-fit case enginee
    pio device monitor -b 115200
    ```
 
-### Option 2: Seatless Wireless Over-The-Air (OTA) Update
+---
 
-Once flashed, you never need to plug a USB cable into the bike again:
-1. Compile the firmware binary:
-   ```bash
-   pio run
+### 2. Enable GitHub Pages (Host Web Cockpit in 30 Seconds)
+
+The Web BLE Cockpit (`index.html`) can be hosted directly from this repository for free with zero maintenance:
+
+1. Open your repository on GitHub: [**https://github.com/Tap202/Euro5Cleaner**](https://github.com/Tap202/Euro5Cleaner)
+2. Go to **Settings** $\to$ **Pages** (in the left navigation sidebar).
+3. Under **Build and deployment**:
+   * **Source:** Select `Deploy from a branch`
+   * **Branch:** Select `main`
+   * **Folder:** Select `/ (root)`
+   * Click **Save**.
+4. Within ~1 minute, GitHub will publish your live dashboard at:
    ```
-   *(Binary generated at `.pio/build/esp32-c3-supermini/firmware.bin`)*
-2. Connect phone/laptop to Wi-Fi **`MT09-SP-CAN`**.
-3. Open **`http://192.168.4.1/update`** in any browser.
-4. Select `firmware.bin` and click **Upload & Flash**. The ESP32 updates and reboots within 5 seconds!
+   https://tap202.github.io/Euro5Cleaner/
+   ```
+5. Open that URL on iOS (via [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055)) or Android/PC (via Chrome) to control your MT-09 wirelessly!
 
 ---
 
@@ -196,14 +212,9 @@ Type any key into the Serial Monitor at **115200 baud** to interact directly wit
 | `?` or `h` | **Help Menu** | Prints interactive command reference. |
 | `r` | **Scan DTCs** | Queries active & pending fault codes (Mode 03/07) and decodes plain-English text. |
 | `k` | **Clear DTCs** | Safely transmits Mode 04 clear command to reset Check Engine Light (engine-off only). |
-| `t` | **Snapshot** | Displays live RPM, speed, gear, TPS %, coolant temp, battery volts, and lean angle. |
-| `s` | **Bus Health** | Prints CAN controller state, frames/sec (FPS), total frame count, and error counters. |
-| `u` | **Unique IDs** | Prints discovered CAN ID table with frequencies (Hz), intervals, and hex payloads. |
+| `l` | **List Logs** | Displays table of persistent NVS clear events recorded in flash memory. |
+| `e` | **Erase Logs** | Wipes stored clear history from NVS flash memory. |
 | `a` | **Auto-Cleaner** | Toggles autonomous background auto-cleaning on/off. |
-| `l` | **Mode Toggle** | Switches between `LISTEN-ONLY` (passive sniffer) and `NORMAL` (active OBD & ACK). |
-| `b` | **Cycle Baud** | Cycles speed on the fly: `500k` $\to$ `250k` $\to$ `1M` $\to$ `125k`. |
-| `p` | **Pause / Play** | Pauses terminal packet printing without losing background statistics. |
-| `c` | **Reset** | Clears counters, unique ID table, and peak lean angle memory. |
 | `z` | **Deep Sleep** | Immediately puts ESP32 into ultra-low power deep sleep (wakes on CAN RX). |
 
 ---

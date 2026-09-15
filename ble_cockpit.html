@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="MT09 Cleaner">
+  <meta name="theme-color" content="#07090e">
+  <title>MT-09 SP | Euro 5 DTC Cleaner (BLE)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #07090e;
+      --card-bg: rgba(18, 24, 38, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --accent: #00e5ff;
+      --accent-glow: rgba(0, 229, 255, 0.25);
+      --green: #10b981;
+      --green-glow: rgba(16, 185, 129, 0.2);
+      --red: #ef4444;
+      --red-glow: rgba(239, 68, 68, 0.2);
+      --amber: #f59e0b;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: 'Inter', sans-serif;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 16px;
+      overflow-x: hidden;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 620px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Header */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 18px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      backdrop-filter: blur(12px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .brand-icon {
+      font-size: 24px;
+    }
+
+    .brand-text h1 {
+      font-size: 15px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      color: #fff;
+    }
+
+    .brand-text p {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .btn-connect {
+      background: var(--accent);
+      color: #050b14;
+      font-weight: 700;
+      font-size: 13px;
+      padding: 8px 16px;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+      box-shadow: 0 0 16px var(--accent-glow);
+    }
+
+    .btn-connect:active {
+      transform: scale(0.96);
+    }
+
+    .btn-connect.connected {
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--green);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      box-shadow: none;
+    }
+
+    /* Cards */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      padding: 20px;
+      backdrop-filter: blur(12px);
+    }
+
+    .card-title {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: var(--text-muted);
+      margin-bottom: 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* Status Grid */
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+    }
+
+    .status-box {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 14px;
+    }
+
+    .status-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .status-val {
+      font-size: 18px;
+      font-weight: 800;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .status-val.clean { color: var(--green); text-shadow: 0 0 10px var(--green-glow); }
+    .status-val.fault { color: var(--red); text-shadow: 0 0 10px var(--red-glow); }
+    .status-val.stopped { color: var(--accent); }
+    .status-val.running { color: var(--amber); }
+    .status-val.offline { color: #64748b; }
+
+    /* Action Buttons */
+    .action-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .btn-action {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--card-border);
+      color: #fff;
+      font-weight: 700;
+      font-size: 14px;
+      padding: 14px;
+      border-radius: 14px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.2s ease;
+    }
+
+    .btn-action span.desc {
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--text-muted);
+    }
+
+    .btn-action:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .btn-action:active {
+      transform: scale(0.97);
+    }
+
+    .btn-scan {
+      border-color: rgba(0, 229, 255, 0.3);
+      color: var(--accent);
+    }
+
+    .btn-clear {
+      border-color: rgba(239, 68, 68, 0.3);
+      color: var(--red);
+    }
+
+    /* DTC List */
+    .dtc-item {
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      border-radius: 12px;
+      padding: 12px 16px;
+      margin-bottom: 8px;
+    }
+
+    .dtc-code {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 800;
+      font-size: 15px;
+      color: var(--red);
+      margin-bottom: 4px;
+    }
+
+    .dtc-desc {
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+
+    .dtc-empty {
+      text-align: center;
+      padding: 24px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    /* Log History Table */
+    .table-container {
+      overflow-x: auto;
+      margin-top: 10px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    th {
+      text-align: left;
+      padding: 8px 10px;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--card-border);
+      font-size: 10px;
+      text-transform: uppercase;
+    }
+
+    td {
+      padding: 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      color: #e2e8f0;
+    }
+
+    .tag-ok {
+      color: var(--green);
+      font-weight: 700;
+    }
+
+    .tag-refused {
+      color: var(--amber);
+      font-weight: 700;
+    }
+
+    .btn-subtle {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 11px;
+      cursor: pointer;
+      text-decoration: underline;
+    }
+    .btn-subtle:hover { color: #fff; }
+
+    /* Toast Notification */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      background: #1e293b;
+      color: #fff;
+      padding: 12px 20px;
+      border-radius: 30px;
+      font-size: 13px;
+      font-weight: 600;
+      border: 1px solid rgba(255,255,255,0.1);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+      opacity: 0;
+      transform: translateY(20px);
+      transition: all 0.3s ease;
+      pointer-events: none;
+      z-index: 999;
+    }
+
+    #toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <!-- Top Header -->
+    <header>
+      <div class="brand">
+        <span class="brand-icon">🏍️</span>
+        <div class="brand-text">
+          <h1>YAMAHA MT-09 SP</h1>
+          <p>Autonomous DTC Cleaner</p>
+        </div>
+      </div>
+      <button id="btnConnect" class="btn-connect" onclick="toggleBleConnection()">
+        <span>Connect BLE</span>
+      </button>
+    </header>
+
+    <!-- Web Bluetooth Browser Compatibility Alert -->
+    <div id="bleWarningBanner" style="display:none; background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 14px; padding: 14px 16px; font-size: 12px; color: #fde68a; line-height: 1.55;">
+    </div>
+
+    <!-- System Status Card -->
+    <div class="card">
+      <div class="card-title">
+        <span>ECU Diagnostics & Guard</span>
+        <span id="bleStatusText" style="font-size: 11px; font-weight: normal; color: var(--text-muted);">Disconnected</span>
+      </div>
+
+      <div class="status-grid">
+        <div class="status-box">
+          <div class="status-label">ECU State</div>
+          <div id="valState" class="status-val clean">CLEAN</div>
+        </div>
+        <div class="status-box">
+          <div class="status-label">Engine State</div>
+          <div id="valEngine" class="status-val stopped">STOPPED</div>
+        </div>
+        <div class="status-box">
+          <div class="status-label">Total Cleared</div>
+          <div id="valClears" class="status-val" style="color: var(--accent);">0</div>
+        </div>
+        <div class="status-box">
+          <div class="status-label">Auto-Cleaner</div>
+          <div id="valAuto" class="status-val" style="color: var(--green);">ARMED</div>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="action-grid">
+        <button class="btn-action btn-scan" onclick="sendBleCommand('SCAN')">
+          <span>🔍 Scan Trouble Codes</span>
+          <span class="desc">Query ECU Mode 03/07</span>
+        </button>
+        <button class="btn-action btn-clear" onclick="sendBleCommand('CLEAR')">
+          <span>🧹 Force Clear Codes</span>
+          <span class="desc">Engine-OFF Safe Interlock</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Active Trouble Codes Card -->
+    <div class="card">
+      <div class="card-title">
+        <span>Detected Trouble Codes</span>
+        <span id="dtcCountBadge" style="font-size: 11px; color: var(--text-muted);">0 Codes</span>
+      </div>
+      <div id="dtcListContainer">
+        <div class="dtc-empty">No trouble codes detected in ECU memory.</div>
+      </div>
+    </div>
+
+    <!-- Persistent Clear History Log Card -->
+    <div class="card">
+      <div class="card-title">
+        <span>Persistent Clear History (NVS Flash)</span>
+        <div>
+          <button class="btn-subtle" onclick="sendBleCommand('LOGS')">Refresh</button>
+          &bull;
+          <button class="btn-subtle" onclick="if(confirm('Erase all clear history from flash memory?')) sendBleCommand('ERASE_LOGS')">Erase</button>
+        </div>
+      </div>
+
+      <div class="table-container">
+        <table id="logsTable">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Boot</th>
+              <th>Trigger</th>
+              <th>Code(s)</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody id="logsTableBody">
+            <tr>
+              <td colspan="5" style="text-align:center; color: var(--text-muted); padding: 18px;">
+                Connect via BLE to load persistent flash logs.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast">Ready</div>
+
+  <script>
+    // BLE UUIDs matching the ESP32-C3 Firmware
+    const SERVICE_UUID      = "000018f0-0000-1000-8000-00805f9b34fb";
+    const CHAR_STATUS_UUID  = "000018f1-0000-1000-8000-00805f9b34fb";
+    const CHAR_DTCS_UUID    = "000018f2-0000-1000-8000-00805f9b34fb";
+    const CHAR_CMD_UUID     = "000018f3-0000-1000-8000-00805f9b34fb";
+    const CHAR_LOGS_UUID    = "000018f4-0000-1000-8000-00805f9b34fb";
+
+    let bleDevice = null;
+    let bleServer = null;
+    let charCmd = null;
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.innerText = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 3000);
+    }
+
+    async function toggleBleConnection() {
+      if (!navigator.bluetooth) {
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        if (isIOS) {
+          showToast("⚠️ Safari/Chrome on iOS lacks Web Bluetooth!");
+          alert("📱 iOS Safari & Chrome do not support the Web Bluetooth API.\n\nTo connect to your MT-09 SP from an iPhone, please open this webpage in 'Bluefy - Web BLE Browser' (free on the iOS App Store) or use 'nRF Connect'!");
+        } else {
+          showToast("⚠️ Web Bluetooth not supported!");
+          alert("Web Bluetooth is not supported in this browser.\n\nPlease open this dashboard in Google Chrome or Microsoft Edge.");
+        }
+        return;
+      }
+
+      if (bleDevice && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+        return;
+      }
+
+      try {
+        showToast("Scanning for MT09-Cleaner...");
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ name: 'MT09-Cleaner' }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+        const server = await bleDevice.gatt.connect();
+        bleServer = server;
+
+        const service = await server.getPrimaryService(SERVICE_UUID);
+
+        // 1. Status Characteristic
+        const charStatus = await service.getCharacteristic(CHAR_STATUS_UUID);
+        await charStatus.startNotifications();
+        charStatus.addEventListener('characteristicvaluechanged', (e) => {
+          handleStatusUpdate(new TextDecoder().decode(e.target.value));
+        });
+        const initialStatus = await charStatus.readValue();
+        handleStatusUpdate(new TextDecoder().decode(initialStatus));
+
+        // 2. DTCs Characteristic
+        const charDtcs = await service.getCharacteristic(CHAR_DTCS_UUID);
+        await charDtcs.startNotifications();
+        charDtcs.addEventListener('characteristicvaluechanged', (e) => {
+          handleDtcsUpdate(new TextDecoder().decode(e.target.value));
+        });
+        const initialDtcs = await charDtcs.readValue();
+        handleDtcsUpdate(new TextDecoder().decode(initialDtcs));
+
+        // 3. Command Characteristic
+        charCmd = await service.getCharacteristic(CHAR_CMD_UUID);
+
+        // 4. Logs Characteristic
+        const charLogs = await service.getCharacteristic(CHAR_LOGS_UUID);
+        await charLogs.startNotifications();
+        charLogs.addEventListener('characteristicvaluechanged', (e) => {
+          handleLogsUpdate(new TextDecoder().decode(e.target.value));
+        });
+        const initialLogs = await charLogs.readValue();
+        handleLogsUpdate(new TextDecoder().decode(initialLogs));
+
+        document.getElementById('btnConnect').innerText = "Connected";
+        document.getElementById('btnConnect').classList.add('connected');
+        document.getElementById('bleStatusText').innerText = "Connected via BLE";
+        document.getElementById('bleStatusText').style.color = "var(--green)";
+        showToast("🎉 Connected to MT-09 SP!");
+
+      } catch (err) {
+        console.error(err);
+        showToast("Connection failed: " + err.message);
+      }
+    }
+
+    function onDisconnected() {
+      document.getElementById('btnConnect').innerText = "Connect BLE";
+      document.getElementById('btnConnect').classList.remove('connected');
+      document.getElementById('bleStatusText').innerText = "Disconnected";
+      document.getElementById('bleStatusText').style.color = "var(--text-muted)";
+      showToast("Disconnected from MT-09");
+    }
+
+    let lastEcuOnline = false;
+
+    async function sendBleCommand(cmd) {
+      if (!charCmd) {
+        showToast("⚠️ Not connected to ESP32 via BLE");
+        return;
+      }
+      try {
+        const encoder = new TextEncoder();
+        await charCmd.writeValue(encoder.encode(cmd));
+        showToast(`Command [${cmd}] sent!`);
+      } catch (err) {
+        console.error(err);
+        showToast("Command failed: " + err.message);
+      }
+    }
+
+    function handleStatusUpdate(jsonStr) {
+      try {
+        const data = JSON.parse(jsonStr);
+        lastEcuOnline = (data.online !== false) && (data.state !== 'OFFLINE');
+
+        const stateEl = document.getElementById('valState');
+        const engEl = document.getElementById('valEngine');
+
+        if (!lastEcuOnline) {
+          stateEl.innerText = 'OFFLINE';
+          stateEl.className = 'status-val offline';
+          engEl.innerText = 'KEY OFF';
+          engEl.className = 'status-val offline';
+        } else {
+          stateEl.innerText = data.state;
+          stateEl.className = 'status-val ' + (data.state === 'CLEAN' ? 'clean' : 'fault');
+          engEl.innerText = data.engine;
+          engEl.className = 'status-val ' + (data.engine === 'STOPPED' ? 'stopped' : 'running');
+        }
+
+        document.getElementById('valClears').innerText = data.clears;
+        document.getElementById('valAuto').innerText = data.auto ? 'ARMED' : 'OFF';
+      } catch (e) {
+        console.warn("Status parse error:", e);
+      }
+    }
+
+    function handleDtcsUpdate(jsonStr) {
+      try {
+        const data = JSON.parse(jsonStr);
+        const container = document.getElementById('dtcListContainer');
+
+        if (data.online === false) {
+          document.getElementById('dtcCountBadge').innerText = 'ECU Offline';
+          container.innerHTML = `
+            <div class="dtc-empty" style="color:var(--amber); line-height: 1.6;">
+              ⚠️ <strong>Motorcycle ECU is OFFLINE (Ignition is OFF)</strong><br>
+              <span style="font-size:11px;color:var(--text-muted);">
+                Turn the ignition key to <strong>ON</strong> (Engine OFF) to scan or clear active trouble codes.
+              </span>
+            </div>
+          `;
+          return;
+        }
+
+        document.getElementById('dtcCountBadge').innerText = `${data.count} Codes`;
+
+        if (!data.codes || data.codes.length === 0) {
+          container.innerHTML = '<div class="dtc-empty">✅ Clean ECU! 0 trouble codes stored in memory.</div>';
+          return;
+        }
+
+        let html = '';
+        data.codes.forEach(dtc => {
+          html += `
+            <div class="dtc-item">
+              <div class="dtc-code">${dtc.code}</div>
+              <div class="dtc-desc">${dtc.desc}</div>
+            </div>
+          `;
+        });
+        container.innerHTML = html;
+      } catch (e) {
+        console.warn("DTC parse error:", e);
+      }
+    }
+
+    function handleLogsUpdate(jsonStr) {
+      try {
+        const data = JSON.parse(jsonStr);
+        const tbody = document.getElementById('logsTableBody');
+
+        if (!data.logs || data.logs.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:16px;">(No clear events logged in NVS memory yet)</td></tr>';
+          return;
+        }
+
+        let rows = '';
+        data.logs.forEach(log => {
+          const resClass = (log.res === 'CLEARED_OK') ? 'tag-ok' : 'tag-refused';
+          rows += `
+            <tr>
+              <td>#${log.id}</td>
+              <td>${log.boot}</td>
+              <td>${log.trig}</td>
+              <td style="color:#f87171;">${log.codes}</td>
+              <td class="${resClass}">${log.res}</td>
+            </tr>
+          `;
+        });
+        tbody.innerHTML = rows;
+      } catch (e) {
+        console.warn("Logs parse error:", e);
+      }
+    }
+
+    function checkBrowserSupport() {
+      if (!navigator.bluetooth) {
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        const banner = document.getElementById('bleWarningBanner');
+        if (banner) {
+          banner.style.display = 'block';
+          if (isIOS) {
+            banner.innerHTML = `
+              <strong>📱 iOS (iPhone/iPad) User Notice:</strong> Apple's Safari and Chrome do not support the Web Bluetooth API.<br>
+              To connect to your bike via Bluetooth directly from this page, open this URL in the free <strong><a href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055" target="_blank" style="color:var(--accent); font-weight:bold; text-decoration:underline;">Bluefy – Web BLE Browser</a></strong> or use the <strong>nRF Connect</strong> app from the App Store.
+            `;
+          } else {
+            banner.innerHTML = `
+              <strong>⚠️ Web Bluetooth Not Supported:</strong> This browser cannot communicate directly with Bluetooth devices.<br>
+              Please open this page in <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong> on Android/PC/Mac.
+            `;
+          }
+        }
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', checkBrowserSupport);
+  </script>
+</body>
+</html>
